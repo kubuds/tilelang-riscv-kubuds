@@ -10,6 +10,7 @@
 #include "spert.hpp"
 #include <cstdlib>
 #include <cmath>
+extern "C" int ime2_gemv_multi(const void * const *, const int *, int, const float *, float * const *, int);
 #include <cstring>
 #include <algorithm>
 #include <vector>
@@ -202,5 +203,44 @@ extern "C" int qwen_layer_fwd(
     silu_mul_f32(g, u, g, FF);
     if (ime2_gemv_q4(wd, g, d, HID, FF)) return -1;
     for (int i = 0; i < HID; ++i) x[i] += d[i];
+    return 0;
+}
+
+extern "C" int ime2_gemv_multi(const void * const * ws, const int * Ns, int count,
+                               const float * x, float * const * ys, int K) {
+    static spert::Stream * st = nullptr;
+    static uint8_t * qa = nullptr;
+    static size_t qb = 0;
+    size_t a_row = (size_t)(K / 32) * spacemit_kernels::q8_blk_size(32, true);
+    if (!st) {
+        spert::StreamConfig c;
+        c.n_cores = 4;
+        st = new spert::Stream(c);
+        if (!st->valid()) return -1;
+    }
+    if (a_row * 4 > qb) {
+        free(qa);
+        qb = a_row * 4;
+        qa = (uint8_t *)aligned_alloc(64, qb);
+    }
+    auto fut = st->launch(
+        spert::Grid{4u},
+        [](spert::Context * c, uint8_t * qa, const float * x, size_t a_row,
+           const void * const * ws, const int * Ns, int count, float * const * ys, int K) {
+            uint32_t ith = c->program_id(0);
+            uint8_t * q = qa + (size_t)ith * a_row;
+            spacemit_kernels::rvv::quantize_a_row_i8(32, x, K, q);
+            size_t group = (size_t)(K / 32) * 576;
+            for (int m = 0; m < count; ++m) {
+                int N = Ns[m];
+                int per = (N + 3) / 4, n0 = ith * per, n1 = std::min(N, n0 + per);
+                if (n0 >= n1) continue;
+                const uint8_t * b = (const uint8_t *)ws[m] + (size_t)(n0 / 32) * group;
+                spacemit_kernels::ime2::gemm_kernel_i8i4(32, q, b, nullptr, ys[m] + n0, 1,
+                                                         (size_t)(n1 - n0), K / 32, N);
+            }
+        },
+        qa, x, a_row, ws, Ns, count, ys, K);
+    fut.sync();
     return 0;
 }
