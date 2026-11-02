@@ -175,6 +175,26 @@ from .tile_schedule import (
 )
 
 
+def gemm_cblas(A, B, C, M, N, K):
+    """Emit a row-major single-precision GEMM via OpenBLAS (RISC-V CPU path).
+
+    The host process must preload libopenblas with RTLD_GLOBAL so that the
+    generated module can resolve cblas_sgemm at dlopen time.
+    """
+    from .tir.ir import address_of, call_extern
+
+    import_source("#include <cblas.h>")
+    return call_extern(
+        "void", "cblas_sgemm",
+        101, 111, 111, M, N, K,
+        1.0,
+        address_of(A[0, 0]), K,
+        address_of(B[0, 0]), N,
+        0.0,
+        address_of(C[0, 0]), N,
+    )
+
+
 def import_source(source: str | None = None):
     # source is the source code to be imported
     from tvm.tirx.script.builder.ir import sblock_attr
@@ -197,6 +217,7 @@ _LOCAL_EXPORTS = (
     "GemmWarpPolicy",
     "Kernel",
     "KernelLaunchFrame",
+    "gemm_cblas",
     "Layout",
     "LocalBuffer",
     "Parallel",
