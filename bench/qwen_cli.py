@@ -69,7 +69,24 @@ ptrs += [nf.ctypes.data, cosT.ctypes.data, sinT.ctypes.data, lm.ctypes.data,
 arr = (ctypes.c_void_p * len(ptrs))(*ptrs)
 
 
-def run(prompt, ngen=24, temp=0.0, topk=1):
+def sample(lg, temp, topk, topp):
+    if temp <= 1e-6:
+        return int(np.argmax(lg))
+    l = lg / np.float32(temp)
+    k = min(max(topk, 1), l.size)
+    order = np.argpartition(l, -k)[-k:]
+    order = order[np.argsort(l[order])[::-1]]
+    p = np.exp(l[order] - l[order].max())
+    p /= p.sum()
+    c = np.cumsum(p)
+    keep = int(np.searchsorted(c, topp) + 1) if topp < 1.0 else len(p)
+    keep = max(keep, 1)
+    order, p = order[:keep], p[:keep]
+    p /= p.sum()
+    return int(np.random.choice(order, p=p))
+
+
+def run(prompt, ngen=24, temp=0.0, topk=1, topp=1.0):
     ids = bpe.encode(prompt)
     KC[:] = 0; VC[:] = 0
     for pos, t in enumerate(ids):
@@ -78,15 +95,7 @@ def run(prompt, ngen=24, temp=0.0, topk=1):
     out = []
     t0 = time.perf_counter()
     for i in range(ngen):
-        lg = logits[:VOCAB]
-        if temp <= 1e-6:
-            cur = int(np.argmax(lg))
-        else:
-            l = lg / temp
-            k = min(topk, VOCAB)
-            idx = np.argpartition(l, -k)[-k:]
-            p = np.exp(l[idx] - l[idx].max()); p /= p.sum()
-            cur = int(np.random.choice(idx, p=p))
+        cur = sample(logits[:VOCAB], temp, topk, topp)
         out.append(cur)
         xv[:] = embed(cur)
         if lib.qwen_graph_fwd(arr, len(ids) + i, MAXT) != 0:
@@ -98,7 +107,10 @@ def run(prompt, ngen=24, temp=0.0, topk=1):
 if __name__ == "__main__":
     prompt = sys.argv[1] if len(sys.argv) > 1 else "The capital of France is"
     n = int(sys.argv[2]) if len(sys.argv) > 2 else 24
-    p, o, ms = run(prompt, n)
+    temp = float(sys.argv[3]) if len(sys.argv) > 3 else 0.0
+    topk = int(sys.argv[4]) if len(sys.argv) > 4 else 40
+    topp = float(sys.argv[5]) if len(sys.argv) > 5 else 0.9
+    p, o, ms = run(prompt, n, temp, topk, topp)
     print("prompt:", p)
     print("output:", o)
     print(f"{ms*1e3:.2f} ms/token  {1/ms:.1f} tok/s")

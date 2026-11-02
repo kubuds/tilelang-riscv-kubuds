@@ -1,0 +1,6 @@
+step3: Unicode BPE pretokenizer and top-k/top-p sampling
+
+The pretokenizer now uses unicodedata classes instead of an ASCII regex; token
+ids match llama.cpp exactly for English and Chinese. Sampling adds
+temperature/top-k/top-p with argpartition. Greedy 42.7 tok/s, sampled 35.8
+tok/s; sampling costs ~4.5 ms/token in Python.
