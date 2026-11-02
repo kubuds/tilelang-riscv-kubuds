@@ -7,3 +7,6 @@ TileLang v0.1.15 RISC-V build notes (K3)
 5. Build: cmake -G Ninja -DUSE_CUDA=OFF -DUSE_ROCM=OFF -DUSE_ASCEND=OFF -DUSE_LLVM=ON -DLLVM_CONFIG=/usr/lib/llvm-19/bin/llvm-config -DPython3_EXECUTABLE=/usr/bin/python3
 6. Baseline: python3 baseline_add.py -> PASS (max_err 0.0), target llvm/riscv64-unknown-linux-gnu, mattr +m,+a,+f,+d.
 7. baseline_rv64gc.py (GEMM) fails in LayoutInference: fragment C_l layout cannot be inferred on the CPU pipeline (backend gap, next work item).
+
+8. Pure RV64GC GEMM baseline (64x64x64, global-memory loops, no T.gemm): PASS, max_abs_err=0.0, 0.467 ms, 1.123 GFLOPS.
+9. objdump of the cached kernel: 0 vsetvli, scalar flw/fsd only -> RVV is off as intended.
