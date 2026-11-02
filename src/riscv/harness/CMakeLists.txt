@@ -65,3 +65,9 @@ add_executable(riscv_kernel_harness riscv_kernel_harness.cc)
 # register the `__TVMBackend*` context symbols that kernel libraries bind
 # (workspace allocation for local buffers, parallel launch, ...).
 target_link_libraries(riscv_kernel_harness PRIVATE "-Wl,--no-as-needed" tvm_runtime "-Wl,--as-needed" tvm_ffi_header)
+
+# SpacemiT IME-2.0 MMA reference simulator (see ime2/ime2_sim.cc).  Kernels
+# using the tilelang.riscv.ime intrinsics link this static library; on real
+# hardware the vendor runtime provides the same entry points.
+add_library(spacemit_ime2_sim STATIC "${CMAKE_CURRENT_LIST_DIR}/../ime2/ime2_sim.cc")
+set_target_properties(spacemit_ime2_sim PROPERTIES POSITION_INDEPENDENT_CODE ON)

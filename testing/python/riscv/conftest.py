@@ -59,6 +59,29 @@ requires_qemu_stack = pytest.mark.skipif(
 )
 
 
+def default_ime2_sim_dir() -> str:
+    """Directory containing the IME-2.0 reference simulator (libspacemit_ime2_sim.a)."""
+
+    env = os.environ.get("TILELANG_IME2_SIM_LIBDIR")
+    if env:
+        return env
+    return str(tlqemu.default_harness_path().parent)
+
+
+def _ime2_sim_available() -> bool:
+    try:
+        candidate = os.path.join(default_ime2_sim_dir(), "libspacemit_ime2_sim.a")
+        return os.path.exists(candidate)
+    except RuntimeError:
+        return False
+
+
+requires_ime2_sim = pytest.mark.skipif(
+    not _ime2_sim_available(),
+    reason="IME-2.0 reference simulator not built (src/riscv/harness CMake project)",
+)
+
+
 def compile_riscv_kernel(func, target="riscv64", out_idx=None, **kwargs):
     """Compile a TileLang kernel for a RISC-V target (cross or native)."""
     return tilelang.compile(func, target=target, out_idx=out_idx, execution_backend="tvm_ffi", **kwargs)
