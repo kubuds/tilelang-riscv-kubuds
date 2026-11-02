@@ -66,6 +66,24 @@ def _proc_cpuinfo_isa() -> str | None:
     return None
 
 
+def _isa_tokens(isa: str) -> set[str]:
+    """Tokenize a /proc/cpuinfo ISA string.
+
+    The base ISA part concatenates single-letter extensions (``rv64gcv``),
+    while multi-letter extensions are underscore-separated (``zvl256b``).
+    """
+
+    tokens = set()
+    for part in re.split(r"[_\s]", isa.lower()):
+        if not part:
+            continue
+        if re.fullmatch(r"rv\d\d[a-z]+", part):
+            tokens.update(part[4:])
+        else:
+            tokens.add(part)
+    return tokens
+
+
 def detect_vector() -> bool:
     """Whether the host implements a usable RISC-V Vector extension."""
 
@@ -74,8 +92,7 @@ def detect_vector() -> bool:
         return bool(value & RISCV_HWPROBE_HWCAP_V)
     isa = _proc_cpuinfo_isa()
     if isa:
-        tokens = re.split(r"[_\s]", isa.lower())
-        return "v" in tokens
+        return "v" in _isa_tokens(isa)
     return False
 
 
@@ -87,7 +104,7 @@ def detect_vlen() -> int | None:
     isa = _proc_cpuinfo_isa()
     vlen = 128  # minimum guaranteed by the V extension
     if isa:
-        for token in re.split(r"[_\s]", isa.lower()):
+        for token in _isa_tokens(isa):
             match = re.fullmatch(r"zvl(\d+)b", token)
             if match:
                 vlen = max(vlen, int(match.group(1)))
@@ -103,8 +120,7 @@ def detect_bitmanip() -> bool:
         return (value & (0xF << 3)) == (0xF << 3)
     isa = _proc_cpuinfo_isa()
     if isa:
-        tokens = set(re.split(r"[_\s]", isa.lower()))
-        return {"zba", "zbb", "zbc", "zbs"} <= tokens
+        return {"zba", "zbb", "zbc", "zbs"} <= _isa_tokens(isa)
     return False
 
 

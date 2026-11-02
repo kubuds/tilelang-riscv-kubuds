@@ -18,6 +18,7 @@ dictionary when you need options such as GPU architecture or CPU model. The most
 | `hip` | AMD GPUs via ROCm. Use a config dict for options such as `{"kind": "hip", "mcpu": "gfx90a"}`. |
 | `metal` | Apple Silicon GPUs (arm64 Macs). |
 | `llvm` | CPU execution. Use a config dict for options such as `{"kind": "llvm", "mtriple": "x86_64-linux-gnu"}`. |
+| `riscv64`, `sg2042`, `k3-x100`, `k3-a100` | RISC-V CPUs (RV64GC baseline, SpacemiT K3 X100/A100). See [RISC-V Support](riscv.md). |
 | `webgpu` | Browser / WebGPU runtimes. |
 | `c` | Emit plain C source for inspection or custom toolchains. |
 
