@@ -98,15 +98,25 @@ def qemu_prefix() -> str | None:
 class QEMUTensor:
     """One tensor argument of the kernel call.
 
-    ``data`` is both the input payload (when ``is_input``) and the buffer that
-    receives results (when ``not is_input``).  Pass a preallocated array of the
-    right dtype/shape for outputs.
+    ``data`` carries the input payload (when ``is_input``) and receives the
+    result (when ``is_output``).  A plain output is ``is_input=False``; a
+    read-write buffer (e.g. a GEMM accumulator) is ``is_input=True,
+    is_output=True``.  ``is_output`` defaults to ``not is_input``.
     """
 
     data: np.ndarray
     is_input: bool = True
     name: str = ""
+    is_output: bool | None = None
     meta: dict = field(default_factory=dict)
+
+    def __post_init__(self):
+        if self.is_output is None:
+            self.is_output = not self.is_input
+
+    @property
+    def io_flags(self) -> int:
+        return (1 if self.is_input else 0) | (2 if self.is_output else 0)
 
 
 def _dl_dtype_of(arr: np.ndarray) -> tuple[int, int, int]:
@@ -157,7 +167,7 @@ def _encode_request(args: list[QEMUTensor | int | float]) -> bytes:
             continue
         code, bits, lanes = _dl_dtype_of(arg.data)
         out += struct.pack("<i", 1)
-        out += struct.pack("<iiiii", 1 if arg.is_input else 0, code, bits, lanes, arg.data.ndim)
+        out += struct.pack("<iiiii", arg.io_flags, code, bits, lanes, arg.data.ndim)
         for dim in arg.data.shape:
             out += struct.pack("<q", dim)
     for arg in args:
@@ -172,7 +182,7 @@ def _decode_response(blob: bytes, args: list[QEMUTensor | int | float]) -> None:
         raise RuntimeError(f"kernel execution failed under QEMU (status={status})")
     offset = 4
     for arg in args:
-        if isinstance(arg, QEMUTensor) and not arg.is_input:
+        if isinstance(arg, QEMUTensor) and arg.is_output:
             nbytes = arg.data.nbytes
             chunk = blob[offset : offset + nbytes]
             if len(chunk) != nbytes:
@@ -204,8 +214,8 @@ def run_kernel(
     args:
         Kernel arguments in declaration order: :class:`QEMUTensor` for buffers,
         plain ``int`` for integer (shape) parameters and plain ``float`` for
-        floating-point scalar parameters.  Output buffers are the entries with
-        ``is_input=False`` and are filled in-place.
+        floating-point scalar parameters.  Buffers with ``is_output=True`` are
+        copied back after the call (in-place in ``data``).
     vlen:
         Request a specific RVV vector length for the emulated CPU (``None``
         for the scalar RV64GC baseline).
@@ -241,4 +251,4 @@ def run_kernel(
             f"cmd: {' '.join(cmd)}\nstderr:\n{proc.stderr.decode('utf-8', errors='replace')}"
         )
     _decode_response(proc.stdout, args)
-    return [arg for arg in args if isinstance(arg, QEMUTensor) and not arg.is_input]
+    return [arg for arg in args if isinstance(arg, QEMUTensor) and arg.is_output]

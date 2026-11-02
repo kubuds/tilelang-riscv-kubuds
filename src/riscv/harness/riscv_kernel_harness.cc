@@ -19,9 +19,11 @@
  *   arg      := int32:kind
  *               kind==0 (scalar int64):   int64:value
  *               kind==2 (scalar float64): float64:value
- *               kind==1 (tensor):         int32:is_input int32:dtype_code
+ *               kind==1 (tensor):         int32:io_flags int32:dtype_code
  *                                         int32:dtype_bits int32:dtype_lanes
  *                                         int32:ndim int64:dims[ndim]
+ *   io_flags := bit0 = payload sent to the kernel (input)
+ *               bit1 = payload copied back after the call (output)
  *   payload  := raw row-major bytes of every is_input tensor, in arg order
  *   response := int32:status (0 == OK) payload'
  *   payload' := raw row-major bytes of every !is_input tensor, in arg order
@@ -47,12 +49,15 @@ namespace {
 constexpr char kMagic[4] = {'T', 'L', 'R', '1'};
 
 struct TensorArg {
-  bool is_input;
+  int io_flags;  // bit0: input payload, bit1: output payload
   DLDataType dtype;
   std::vector<int64_t> shape;
   std::vector<int64_t> strides;
   std::vector<uint8_t> data;
   DLTensor dl_tensor{};
+
+  bool IsInput() const { return (io_flags & 1) != 0; }
+  bool IsOutput() const { return (io_flags & 2) != 0; }
 
   size_t Numel() const {
     size_t n = 1;
@@ -121,13 +126,13 @@ int main(int argc, char** argv) {
       float_scalars.push_back(value);
     } else if (kind == 1) {
       TensorArg t;
-      int32_t is_input = 0, code = 0, bits = 0, lanes = 0, ndim = 0;
-      if (!ReadExact(in, &is_input, sizeof(is_input)) || !ReadExact(in, &code, sizeof(code)) ||
+      int32_t io_flags = 0, code = 0, bits = 0, lanes = 0, ndim = 0;
+      if (!ReadExact(in, &io_flags, sizeof(io_flags)) || !ReadExact(in, &code, sizeof(code)) ||
           !ReadExact(in, &bits, sizeof(bits)) || !ReadExact(in, &lanes, sizeof(lanes)) ||
           !ReadExact(in, &ndim, sizeof(ndim)) || ndim < 0 || ndim > 8) {
         Fail("truncated tensor descriptor");
       }
-      t.is_input = is_input != 0;
+      t.io_flags = io_flags;
       t.dtype.code = static_cast<uint8_t>(code);
       t.dtype.bits = static_cast<uint8_t>(bits);
       t.dtype.lanes = static_cast<uint16_t>(lanes);
@@ -141,12 +146,12 @@ int main(int argc, char** argv) {
     }
   }
 
-  // Payload: raw bytes of every input tensor, in declaration order.  Output
-  // buffers are still allocated here (zero-filled) so kernels always receive
-  // valid data pointers.
+  // Payload: raw bytes of every input tensor, in declaration order.  All
+  // buffers are allocated here (zero-filled) so kernels always receive valid
+  // data pointers.
   for (auto& t : tensors) {
     t.data.resize(t.NumBytes(), 0);
-    if (!t.is_input) continue;
+    if (!t.IsInput()) continue;
     if (t.NumBytes() > 0 && !ReadExact(in, t.data.data(), t.NumBytes())) Fail("truncated tensor payload");
   }
 
@@ -200,7 +205,7 @@ int main(int argc, char** argv) {
   if (!WriteExact(out, &status, sizeof(status))) Fail("cannot write status");
   if (status == 0) {
     for (const auto& t : tensors) {
-      if (t.is_input) continue;
+      if (!t.IsOutput()) continue;
       if (t.NumBytes() > 0 && !WriteExact(out, t.data.data(), t.NumBytes())) Fail("cannot write output payload");
     }
   }

@@ -240,6 +240,21 @@ class KernelCache:
         except OSError:
             pass
 
+    @staticmethod
+    def _get_export_link_env_stamp() -> dict[str, str] | None:
+        """Link-environment inputs that change the produced shared library.
+
+        Cross-compile link settings (the RISC-V toolchain and e.g. BLAS
+        libraries) are read from the environment at export time; include them
+        in the cache key so switching them cannot reuse a stale binary.
+        Only non-empty environments participate, leaving keys of other
+        workflows unchanged.
+        """
+
+        names = ("TILELANG_RISCV_GCC", "TILELANG_RISCV_SYSROOT", "TILELANG_RISCV_CFLAGS", "TILELANG_RISCV_LDFLAGS")
+        values = {name: os.environ[name] for name in names if os.environ.get(name)}
+        return values or None
+
     def _generate_key(
         self,
         func: Callable,
@@ -278,6 +293,9 @@ class KernelCache:
             "compile_flags": compile_flags,
             **self._get_base_key(),
         }
+        link_env = self._get_export_link_env_stamp()
+        if link_env:
+            key_data["export_link_env"] = link_env
         # Sort keys to ensure consistency
         key_string = json.dumps(key_data, sort_keys=True)
         # Use SHA256 to generate hash key

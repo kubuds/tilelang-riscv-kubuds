@@ -72,14 +72,15 @@ def export_kernel(kernel, path, target=None):
     return path
 
 
-def run_qemu(kernel, args, lib_path, func_name="main", vlen=None, target=None):
+def run_qemu(kernel, args, lib_path, func_name="main", vlen=None, target=None, **kwargs):
     """Export ``kernel`` to ``lib_path`` and invoke it under QEMU.
 
     ``args`` follows :func:`tilelang.riscv.qemu.run_kernel`: one entry per
-    kernel parameter, in declaration order.
+    kernel parameter, in declaration order.  Extra keyword arguments (e.g.
+    ``extra_env``, ``timeout``) are forwarded to the runner.
     """
     export_kernel(kernel, lib_path, target=target)
-    return tlqemu.run_kernel(lib_path, func_name, args, vlen=vlen)
+    return tlqemu.run_kernel(lib_path, func_name, args, vlen=vlen, **kwargs)
 
 
 def np_assert_close(actual: np.ndarray, expected: np.ndarray, rtol=1e-4, atol=1e-4):
