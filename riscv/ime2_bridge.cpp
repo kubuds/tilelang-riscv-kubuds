@@ -10,6 +10,7 @@
 #include "spert.hpp"
 #include <cstdlib>
 #include <cmath>
+#include <riscv_vector.h>
 extern "C" int ime2_gemv_multi(const void * const *, const int *, int, const float *, float * const *, int);
 #include <cstring>
 #include <algorithm>
@@ -241,6 +242,33 @@ extern "C" int ime2_gemv_multi(const void * const * ws, const int * Ns, int coun
             }
         },
         qa, x, a_row, ws, Ns, count, ys, K);
+    fut.sync();
+    return 0;
+}
+
+extern "C" int a100_rvv_add(const float * A, const float * B, float * C, int n) {
+    static spert::Stream * st = nullptr;
+    if (!st) {
+        spert::StreamConfig c;
+        c.n_cores = 4;
+        st = new spert::Stream(c);
+        if (!st->valid()) return -1;
+    }
+    auto fut = st->launch(
+        spert::Grid{4u},
+        [](spert::Context * ctx, const float * A, const float * B, float * C, int n) {
+            uint32_t ith = ctx->program_id(0);
+            int per = (n + 3) / 4, n0 = ith * per, n1 = std::min(n, n0 + per);
+            int i = n0;
+            while (i < n1) {
+                size_t vl = __riscv_vsetvl_e32m8((size_t)(n1 - i));
+                vfloat32m8_t a = __riscv_vle32_v_f32m8(A + i, vl);
+                vfloat32m8_t b = __riscv_vle32_v_f32m8(B + i, vl);
+                __riscv_vse32_v_f32m8(C + i, __riscv_vfadd_vv_f32m8(a, b, vl), vl);
+                i += (int)vl;
+            }
+        },
+        A, B, C, n);
     fut.sync();
     return 0;
 }
