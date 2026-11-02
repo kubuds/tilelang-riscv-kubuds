@@ -331,6 +331,10 @@ def create_backend_context(
             for _feat in ("+m", "+a", "+f", "+d"):
                 if _feat not in _mattr:
                     _mattr.append(_feat)
+            from tilelang.backend.target import _riscv_host_half_features
+            for _feat in _riscv_host_half_features():
+                if _feat not in _mattr:
+                    _mattr.append(_feat)
             target_host = {"kind": "llvm", "mtriple": _mtriple, "mattr": _mattr}
             if _t.attrs.get("mcpu"):
                 target_host["mcpu"] = str(_t.attrs["mcpu"])

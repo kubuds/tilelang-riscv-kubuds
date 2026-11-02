@@ -138,6 +138,27 @@ def determine_target(target: TargetLike | Literal["auto"] = "auto", return_objec
     return _finalize_target(return_var, return_object=return_object)
 
 
+
+def _riscv_host_half_features():
+    """Return +zfh/+zvfh when the running riscv64 CPU advertises them."""
+    try:
+        with open("/proc/cpuinfo", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("isa"):
+                    isa = set()
+                    for tok in line.split(":", 1)[1].split():
+                        isa.update(tok.split("_"))
+                    feats = set()
+                    if "zfh" in isa:
+                        feats.add("+zfh")
+                    if "zvfh" in isa:
+                        feats.add("+zvfh")
+                    return tuple(sorted(feats))
+    except OSError:
+        pass
+    return ()
+
+
 def _normalize_riscv_llvm(target):
     """Ensure riscv64 LLVM targets use the lp64d ABI (+m,+a,+f,+d).
 
@@ -156,6 +177,11 @@ def _normalize_riscv_llvm(target):
         return None
     mattr = [str(x) for x in (t.attrs.get("mattr") or [])]
     for feat in ("+m", "+a", "+f", "+d"):
+        if feat not in mattr:
+            mattr.append(feat)
+    # Add scalar/vector half features that the host CPU actually implements.
+    # Without Zfh, LLVM's f16 arithmetic on riscv64 produces NaN.
+    for feat in _riscv_host_half_features():
         if feat not in mattr:
             mattr.append(feat)
     cfg = {"kind": "llvm", "mtriple": mtriple, "mattr": mattr}
