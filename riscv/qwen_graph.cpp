@@ -16,8 +16,8 @@ namespace qg {
 enum { NL = 28, HID = 1024, NH = 16, NKV = 8, HD = 128, FF = 3072, VOCAB = 151936 };
 struct Args {
     const void * wq[NL], * wk[NL], * wv[NL], * wo[NL], * wg[NL], * wu[NL], * wd[NL];
-    const float * an[NL], * fn[NL];
-    const float * qn, * kn, * cosT, * sinT;
+    const float * an[NL], * fn[NL], * qn[NL], * kn[NL];
+    const float * nf, * cosT, * sinT;
     const void * lm;
     float * x, * KC, * VC, * logits;
     int pos, maxT;
@@ -60,9 +60,10 @@ extern "C" int qwen_graph_fwd(void * const * ptrs, int pos, int maxT) {
         a.wd[l] = ptrs[pi++];
         a.an[l] = (const float *)ptrs[pi++];
         a.fn[l] = (const float *)ptrs[pi++];
+        a.qn[l] = (const float *)ptrs[pi++];
+        a.kn[l] = (const float *)ptrs[pi++];
     }
-    a.qn = (const float *)ptrs[pi++];
-    a.kn = (const float *)ptrs[pi++];
+    a.nf = (const float *)ptrs[pi++];
     a.cosT = (const float *)ptrs[pi++];
     a.sinT = (const float *)ptrs[pi++];
     a.lm = ptrs[pi++];
@@ -114,22 +115,22 @@ extern "C" int qwen_graph_fwd(void * const * ptrs, int pos, int maxT) {
                 ctx->sync();
                 // 2. q/k norm + rope, kv append (heads split)
                 for (int h = ith; h < NH; h += 4) {
-                    rmsnorm(g_q + h * HD, a->qn, g_q + h * HD, HD, 1e-6f);
+                    rmsnorm(g_q + h * HD, a->qn[l], g_q + h * HD, HD, 1e-6f);
                     rope(g_q + h * HD, HD, a->pos, a->cosT, a->sinT);
                 }
                 for (int h = ith; h < NKV; h += 4) {
-                    rmsnorm(g_k + h * HD, a->kn, g_k + h * HD, HD, 1e-6f);
+                    rmsnorm(g_k + h * HD, a->kn[l], g_k + h * HD, HD, 1e-6f);
                     rope(g_k + h * HD, HD, a->pos, a->cosT, a->sinT);
-                    memcpy(a->KC + (size_t)h * a->maxT * HD + (size_t)a->pos * HD, g_k + h * HD, HD * sizeof(float));
-                    memcpy(a->VC + (size_t)h * a->maxT * HD + (size_t)a->pos * HD, g_v + h * HD, HD * sizeof(float));
+                    memcpy(a->KC + (((size_t)l * NKV + h) * a->maxT + a->pos) * HD, g_k + h * HD, HD * sizeof(float));
+                    memcpy(a->VC + (((size_t)l * NKV + h) * a->maxT + a->pos) * HD, g_v + h * HD, HD * sizeof(float));
                 }
                 ctx->sync();
                 // 3. attention, 4 heads per worker
                 for (int h = ith; h < NH; h += 4) {
                     const float * qh = g_q + h * HD;
                     const int kvh = h * NKV / NH;
-                    const float * kh = a->KC + (size_t)kvh * a->maxT * HD;
-                    const float * vh = a->VC + (size_t)kvh * a->maxT * HD;
+                    const float * kh = a->KC + ((size_t)l * NKV + kvh) * a->maxT * HD;
+                    const float * vh = a->VC + ((size_t)l * NKV + kvh) * a->maxT * HD;
                     float * sc = g_sc[ith];
                     float mx = -1e30f;
                     for (int t = 0; t <= a->pos; ++t) {
@@ -182,7 +183,7 @@ extern "C" int qwen_graph_fwd(void * const * ptrs, int pos, int maxT) {
                 ctx->sync();
             }
             // final norm + lm_head (split), argmax by worker 0
-            rmsnorm(a->x, a->an[0], g_xn[ith], HID, 1e-6f);
+            rmsnorm(a->x, a->nf, g_xn[ith], HID, 1e-6f);
             spacemit_kernels::rvv::quantize_a_row_i8(32, g_xn[ith], HID, qai);
             gemv_slice(a->lm, g_xn[ith], a->logits, VOCAB, HID);
             ctx->sync();
