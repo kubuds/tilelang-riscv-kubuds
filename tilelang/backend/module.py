@@ -307,6 +307,35 @@ def _resolve_backend_module(target: Target) -> BackendModule:
     return candidates[0]
 
 
+def _native_llvm_triple() -> str | None:
+    """Triple the bare ``llvm`` target resolves to on this machine."""
+
+    try:
+        attrs = Target("llvm").attrs
+        return attrs.get("mtriple") if hasattr(attrs, "get") else getattr(attrs, "mtriple", None)
+    except Exception:
+        return None
+
+
+def _llvm_cross_target_needs_matching_host(target: Target) -> bool:
+    """Whether an ``llvm`` device target is for a foreign CPU architecture.
+
+    CPU code generation puts host glue and kernel code in the same address
+    space, so when the device target explicitly asks for another architecture
+    (e.g. ``-mtriple=riscv64-unknown-linux-gnu`` cross-compiled on x86), the
+    host target must follow it instead of defaulting to the build machine.
+    """
+
+    if target.kind.name != "llvm":
+        return False
+    attrs = target.attrs
+    mtriple = attrs.get("mtriple") if hasattr(attrs, "get") else getattr(attrs, "mtriple", None)
+    if not mtriple:
+        return False
+    native = _native_llvm_triple()
+    return bool(native) and str(mtriple).strip().lower() != str(native).strip().lower()
+
+
 def create_backend_context(
     target: str | dict[str, object] | Target = "auto",
     target_host: str | dict[str, object] | Target | None = None,
@@ -321,7 +350,13 @@ def create_backend_context(
     assert isinstance(normalized_target, Target)
 
     if target_host is None:
-        target_host = "llvm" if tvm.runtime.enabled("llvm") else "c"
+        if _llvm_cross_target_needs_matching_host(normalized_target):
+            # Cross-compiling CPU code: the host glue must be generated for the
+            # device architecture (e.g. RISC-V kernels linked into a riscv64
+            # shared library), not for the build machine.
+            target_host = normalized_target
+        else:
+            target_host = "llvm" if tvm.runtime.enabled("llvm") else "c"
     normalized_target_host = Target(target_host)
     normalized_target = Target(normalized_target, normalized_target_host)
 

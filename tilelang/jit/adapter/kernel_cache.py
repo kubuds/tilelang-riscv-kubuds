@@ -14,6 +14,15 @@ class TVMFFIKernelCache(KernelCache):
         target_host_kind = getattr(getattr(target_host, "kind", None), "name", None)
         if target_host_kind == "c":
             return KernelCache._get_source_compile_args()
+        target = getattr(artifact, "target", None)
+        if target is not None:
+            # Cross-compiled CPU kernels (e.g. RISC-V built on x86) must be
+            # linked with the target toolchain; the default host linker would
+            # either fail or silently produce a library for the wrong ISA.
+            from tilelang.riscv.export import is_cross_compiling, riscv_export_kwargs
+
+            if is_cross_compiling(target):
+                return riscv_export_kwargs(target)
         return KernelCache._get_export_link_args()
 
     def _save_wrapper_kernel_code_to_disk(self, kernel: JITKernel, cache_path: str, verbose: bool = False):

@@ -152,6 +152,26 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
                 self.executable = executable
             return executable
 
+    def _raise_if_cross_compiled(self) -> None:
+        """Reject in-process execution of kernels built for another ISA.
+
+        Cross-compiled kernels (e.g. RISC-V built on an x86 dev box) are meant
+        to be exported with :mod:`tilelang.riscv.export` and executed on the
+        target; running them here would crash inside the LLVM JIT.
+        """
+
+        import platform
+
+        from tilelang.riscv.export import is_cross_compiling
+
+        if is_cross_compiling(self.target):
+            raise RuntimeError(
+                f"Kernel is cross-compiled for {self.target} but this process runs on "
+                f"{platform.machine()}. Export the kernel with "
+                "tilelang.riscv.export_riscv_library(...) and execute it on the target "
+                "(natively or under qemu-riscv64)."
+            )
+
     def get_exportable_executable(self) -> tvm.runtime.Executable:
         return self._get_executable()
 
@@ -335,6 +355,7 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
 
             if out_device is not None:
                 self._prepare_torch_device(out_device)
+            self._raise_if_cross_compiled()
             executable = self._get_executable()
             executable(*tensor_list)
 
@@ -376,6 +397,7 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
                 # a zero-element anchor solely for that allocator/device state.
                 allocator_anchor = torch.empty(0, device=device)
 
+            self._raise_if_cross_compiled()
             result = self._get_executable()(*inputs, allocator_anchor)
             if len(self.result_idx) == 1:
                 return result
