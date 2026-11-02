@@ -33,16 +33,20 @@ extern "C" int ime2_repack_q4(const void * raw, void * packed, int N, int K) {
 extern "C" int ime2_gemv_q4(const void * packed, const float * x, float * y, int N, int K) {
     static spert::Stream * stream = nullptr;
     static uint8_t * qa = nullptr;
-    static size_t a_row = 0;
+    static size_t qa_bytes = 0;
     const int nw = 4;
-    a_row = (size_t)(K / 32) * spacemit_kernels::q8_blk_size(32, true);
+    size_t a_row = (size_t)(K / 32) * spacemit_kernels::q8_blk_size(32, true);
     if (!stream) {
         spert::StreamConfig cfg;
         cfg.n_cores = (uint32_t)nw;
         stream = new spert::Stream(cfg);
         if (!stream->valid()) return -1;
     }
-    if (!qa) qa = (uint8_t *)aligned_alloc(64, a_row * nw);
+    if (a_row * nw > qa_bytes) {
+        free(qa);
+        qa_bytes = a_row * nw;
+        qa = (uint8_t *)aligned_alloc(64, qa_bytes);
+    }
     auto fut = stream->launch(
         spert::Grid{(uint32_t)nw},
         [](spert::Context * c, uint8_t * qa, const float * x, size_t a_row,
