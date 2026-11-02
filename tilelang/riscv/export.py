@@ -85,19 +85,37 @@ def create_riscv_shared(output: str, objects: Sequence[str], options: Sequence[s
     """``fcompile`` compatible entry point that links RISC-V objects.
 
     Signature matches what :meth:`tvm.runtime.Module.export_library` expects
-    (``fcompile(output, objects, **kwargs)``).  Uses ``tvm.contrib.cc`` so the
-    platform handling stays in one place; all we add is the cross driver and
-    the sysroot/flag environment knobs documented above.
+    (``fcompile(output, objects, **kwargs)``).  We assemble the command line
+    ourselves instead of reusing ``tvm.contrib.cc.create_shared`` because that
+    helper places ``options`` *before* the object files, which silently drops
+    static archives (the linker discards archive members that satisfy no
+    undefined symbol *yet*).  Library tokens (``-lfoo``, ``libfoo.a``,
+    ``libfoo.so``) found in the options are therefore moved after the objects.
+
+    Flag sources (see module docstring): ``TILELANG_RISCV_SYSROOT``,
+    ``TILELANG_RISCV_CFLAGS``, ``TILELANG_RISCV_LDFLAGS``.  Library tokens in
+    any of them are appended after the object files.
     """
-    if _tvm_cc is None:  # pragma: no cover
-        raise RuntimeError("tvm.contrib.cc is unavailable; cannot link RISC-V objects")
     cc = cc or find_riscv_cc()
     if cc is None:
         raise RuntimeError(
             "No riscv64 cross compiler found. Install gcc-riscv64-linux-gnu or set TILELANG_RISCV_GCC to the compiler driver."
         )
-    all_options = [*riscv_link_options(), *(options or ())]
-    _tvm_cc.create_shared(output, list(objects), options=all_options, cc=cc)
+    tokens = [*riscv_link_options(), *(options or ())]
+    pre_flags: list[str] = []
+    post_libs: list[str] = []
+    for token in tokens:
+        if token.startswith("-l") or token.endswith(".a") or token.endswith(".so"):
+            post_libs.append(token)
+        else:
+            pre_flags.append(token)
+    cmd = [cc, "-shared", "-fPIC", "-o", output, *pre_flags, *(str(obj) for obj in objects), *post_libs]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise RuntimeError(f"Linking RISC-V shared library failed: {' '.join(cmd)}\n{proc.stderr}")
+
+
+create_riscv_shared.output_format = "so"
 
 
 def riscv_export_kwargs(target: TargetLike | None = None) -> dict:
@@ -105,16 +123,7 @@ def riscv_export_kwargs(target: TargetLike | None = None) -> dict:
     if target is not None and not is_cross_compiling(target):
         # Native RISC-V host: the default host-toolchain linking is correct.
         return {}
-    if _tvm_cc is None or not hasattr(_tvm_cc, "cross_compiler"):  # pragma: no cover
-        raise RuntimeError("tvm.contrib.cc.cross_compiler is unavailable")
-
-    cc = find_riscv_cc()
-    if cc is None:
-        raise RuntimeError(
-            "No riscv64 cross compiler found. Install gcc-riscv64-linux-gnu or set TILELANG_RISCV_GCC to the compiler driver."
-        )
-    fcompile = _tvm_cc.cross_compiler(cc, options=riscv_link_options())
-    return {"fcompile": fcompile}
+    return {"fcompile": create_riscv_shared}
 
 
 def export_riscv_library(module, file_name: str, target: TargetLike | None = None, **kwargs) -> None:

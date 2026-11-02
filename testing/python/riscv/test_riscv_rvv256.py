@@ -44,10 +44,11 @@ def _disassemble_riscv(lib_path) -> str:
     return out.stdout
 
 
-def _has_rvv_code(lib_path, func_symbol: str) -> bool:
+def _instruction_words(listing: str, func_symbol: str) -> list[int]:
+    """Raw instruction words of one function (works for any disassembler)."""
     import re
 
-    listing = _disassemble_riscv(lib_path)
+    words: list[int] = []
     in_function = False
     for line in listing.splitlines():
         header = re.match(r"^\s*[0-9a-f]+\s+<([^>]+)>", line)
@@ -62,14 +63,15 @@ def _has_rvv_code(lib_path, func_symbol: str) -> bool:
             continue
         tokens = match.group(1).split()
         if len(tokens) == 1 and len(tokens[0]) == 8:
-            word = int(tokens[0], 16)
+            words.append(int(tokens[0], 16))
         elif len(tokens) == 4:
-            word = int("".join(reversed(tokens)), 16)
-        else:
-            continue
-        if word & 0x7F == _RVV_OP_V_OPCODE:
-            return True
-    return False
+            words.append(int("".join(reversed(tokens)), 16))
+    return words
+
+
+def _has_rvv_code(lib_path, func_symbol: str) -> bool:
+    listing = _disassemble_riscv(lib_path)
+    return any(word & 0x7F == _RVV_OP_V_OPCODE for word in _instruction_words(listing, func_symbol))
 
 
 @requires_qemu_stack
