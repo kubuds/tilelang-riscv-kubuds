@@ -135,9 +135,18 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
         if self.rt_mod is None:
             raise RuntimeError("Cannot create TVM FFI executable without a runtime module.")
         executable = runtime.Executable(self.rt_mod)
-        if COMPILE_ARGS:
+        compile_args = dict(COMPILE_ARGS)
+        if self.target.kind.name == "riscv":
+            # RISC-V flags are derived from target attrs (march/mabi/vlen/
+            # ime2); see tilelang/riscv/toolchain.py for the rationale.
+            from tilelang.riscv.toolchain import get_compile_flags as get_riscv_flags
+
+            flags = get_riscv_flags(self.target)
+            if flags:
+                compile_args["options"] = list(compile_args.get("options", [])) + flags
+        if compile_args:
             # Precompile jit module with extra arguments.
-            executable.jit(**COMPILE_ARGS)
+            executable.jit(**compile_args)
         return executable
 
     def _get_executable(self) -> tvm.runtime.Executable:
