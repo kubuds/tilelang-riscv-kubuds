@@ -65,3 +65,39 @@ extern "C" int ime2_gemv_q4(const void * packed, const float * x, float * y, int
     fut.sync();
     return 0;
 }
+
+extern "C" int ime2_gemv_q4_w(const void * packed, const float * x, float * y, int N, int K, int nw) {
+    static spert::Stream * streams[9] = {nullptr};
+    static uint8_t * qa[9] = {nullptr};
+    static size_t qa_bytes[9] = {0};
+    if (nw < 1 || nw > 8) return -2;
+    size_t a_row = (size_t)(K / 32) * spacemit_kernels::q8_blk_size(32, true);
+    if (!streams[nw]) {
+        spert::StreamConfig cfg;
+        cfg.n_cores = (uint32_t)nw;
+        streams[nw] = new spert::Stream(cfg);
+        if (!streams[nw]->valid()) return -1;
+    }
+    if (a_row * nw > qa_bytes[nw]) {
+        free(qa[nw]);
+        qa_bytes[nw] = a_row * nw;
+        qa[nw] = (uint8_t *)aligned_alloc(64, qa_bytes[nw]);
+    }
+    auto fut = streams[nw]->launch(
+        spert::Grid{(uint32_t)nw},
+        [](spert::Context * c, uint8_t * qa, const float * x, size_t a_row,
+           const void * w, float * y, int N, int K, int nw) {
+            uint32_t ith = c->program_id(0);
+            int per = (N + nw - 1) / nw, n0 = ith * per, n1 = std::min(N, n0 + per);
+            if (n0 >= n1) return;
+            uint8_t * q = qa + (size_t)ith * a_row;
+            spacemit_kernels::rvv::quantize_a_row_i8(32, x, K, q);
+            size_t group = (size_t)(K / 32) * 576;
+            const uint8_t * b = (const uint8_t *)w + (size_t)(n0 / 32) * group;
+            spacemit_kernels::ime2::gemm_kernel_i8i4(32, q, b, nullptr, y + n0, 1,
+                                                     (size_t)(n1 - n0), K / 32, N);
+        },
+        qa[nw], x, a_row, packed, y, N, K, nw);
+    fut.sync();
+    return 0;
+}
