@@ -12,6 +12,7 @@
 #include <cmath>
 #include <riscv_vector.h>
 extern "C" int ime2_gemv_multi(const void * const *, const int *, int, const float *, float * const *, int);
+extern "C" int main_kernel(float *, float *, float *);
 #include <cstring>
 #include <algorithm>
 #include <vector>
@@ -269,6 +270,26 @@ extern "C" int a100_rvv_add(const float * A, const float * B, float * C, int n) 
             }
         },
         A, B, C, n);
+    fut.sync();
+    return 0;
+}
+
+extern "C" int a100_tilelang_add(const float * A, const float * B, float * C) {
+    enum { CHUNK = 65536 };
+    static spert::Stream * st = nullptr;
+    if (!st) {
+        spert::StreamConfig c;
+        c.n_cores = 4;
+        st = new spert::Stream(c);
+        if (!st->valid()) return -1;
+    }
+    auto fut = st->launch(
+        spert::Grid{4u},
+        [](spert::Context * ctx, const float * A, const float * B, float * C) {
+            uint32_t ith = ctx->program_id(0);
+            main_kernel((float *)A + (size_t)ith * CHUNK, (float *)B + (size_t)ith * CHUNK, C + (size_t)ith * CHUNK);
+        },
+        A, B, C);
     fut.sync();
     return 0;
 }
