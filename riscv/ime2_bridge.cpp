@@ -140,3 +140,67 @@ extern "C" int qwen_attn_fwd(const float * q, const float * KC, const float * VC
     }
     return 0;
 }
+
+static void rmsnorm_f32(const float * x, const float * w, float * y, int n, float eps) {
+    float s = 0.0f;
+    for (int i = 0; i < n; ++i) s += x[i] * x[i];
+    float r = 1.0f / sqrtf(s / (float)n + eps);
+    for (int i = 0; i < n; ++i) y[i] = x[i] * r * w[i];
+}
+
+static void rope_head(float * v, int hd, int pos, const float * cosT, const float * sinT) {
+    int half = hd / 2;
+    for (int d = 0; d < half; ++d) {
+        float a = v[d], b = v[d + half];
+        float c = cosT[(size_t)pos * half + d], s = sinT[(size_t)pos * half + d];
+        v[d] = a * c - b * s;
+        v[d + half] = a * s + b * c;
+    }
+}
+
+static void silu_mul_f32(const float * g, const float * u, float * o, int n) {
+    for (int i = 0; i < n; ++i) o[i] = (g[i] / (1.0f + expf(-g[i]))) * u[i];
+}
+
+// Qwen3-0.6B single layer, decode (m=1). HID=1024 NH=16 NKV=8 HD=128 FF=3072.
+extern "C" int qwen_layer_fwd(
+    float * x,
+    const void * wq, const void * wk, const void * wv, const void * wo,
+    const void * wg, const void * wu, const void * wd,
+    const float * an, const float * fn, const float * qn, const float * kn,
+    const float * cosT, const float * sinT,
+    int pos, int maxT, float * KC, float * VC) {
+    enum { HID = 1024, NH = 16, NKV = 8, HD = 128, FF = 3072 };
+    static float xn[HID], q[NH * HD], k[NKV * HD], v[NKV * HD], att[NH * HD];
+    static float g[FF], u[FF], o[HID], d[HID];
+
+    rmsnorm_f32(x, an, xn, HID, 1e-6f);
+    if (ime2_gemv_q4(wq, xn, q, NH * HD, HID)) return -1;
+    if (ime2_gemv_q4(wk, xn, k, NKV * HD, HID)) return -1;
+    if (ime2_gemv_q4(wv, xn, v, NKV * HD, HID)) return -1;
+
+    for (int h = 0; h < NH; ++h) {
+        rmsnorm_f32(q + h * HD, qn, q + h * HD, HD, 1e-6f);
+        rope_head(q + h * HD, HD, pos, cosT, sinT);
+    }
+    for (int h = 0; h < NKV; ++h) {
+        rmsnorm_f32(k + h * HD, kn, k + h * HD, HD, 1e-6f);
+        rope_head(k + h * HD, HD, pos, cosT, sinT);
+        for (int i = 0; i < HD; ++i) {
+            KC[(size_t)h * maxT * HD + (size_t)pos * HD + i] = k[h * HD + i];
+            VC[(size_t)h * maxT * HD + (size_t)pos * HD + i] = v[h * HD + i];
+        }
+    }
+    if (qwen_attn_fwd(q, KC, VC, att, NH, NKV, HD, pos, maxT)) return -1;
+
+    if (ime2_gemv_q4(wo, att, o, HID, NH * HD)) return -1;
+    for (int i = 0; i < HID; ++i) x[i] += o[i];
+
+    rmsnorm_f32(x, fn, xn, HID, 1e-6f);
+    if (ime2_gemv_q4(wg, xn, g, FF, HID)) return -1;
+    if (ime2_gemv_q4(wu, xn, u, FF, HID)) return -1;
+    silu_mul_f32(g, u, g, FF);
+    if (ime2_gemv_q4(wd, g, d, HID, FF)) return -1;
+    for (int i = 0; i < HID; ++i) x[i] += d[i];
+    return 0;
+}
