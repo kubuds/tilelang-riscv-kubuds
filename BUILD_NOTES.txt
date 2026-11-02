@@ -10,3 +10,7 @@ TileLang v0.1.15 RISC-V build notes (K3)
 
 8. Pure RV64GC GEMM baseline (64x64x64, global-memory loops, no T.gemm): PASS, max_abs_err=0.0, 0.467 ms, 1.123 GFLOPS.
 9. objdump of the cached kernel: 0 vsetvli, scalar flw/fsd only -> RVV is off as intended.
+
+10. Step 2 first prototype: TileLang prim_func calling cblas_sgemm via T.call_extern (T.import_source + ctypes RTLD_GLOBAL preload). 512^3 f32: 3.519 ms, 76.28 GFLOPS, max_abs_err=0.0 (PASS).
+11. OpenBLAS reference on X100 (numpy, 4 threads): 256^3 64.3, 512^3 71.2, 1024^3 72.3 GFLOPS. Scalar TileLang baseline was 1.12 GFLOPS.
+12. Note: this is an extern-call prototype; T.gemm still has no RISC-V CPU lowering. Next: lower T.gemm to cblas for llvm target, then RVV codegen.
