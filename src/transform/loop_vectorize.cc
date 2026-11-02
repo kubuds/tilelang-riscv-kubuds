@@ -32,6 +32,7 @@
 #include "backend/common/target_utils.h"
 #include "common/int64_promoter.h"
 #include "common/loop_vectorization_utils.h"
+#include "riscv/target_utils.h"
 #include "support/check.h"
 #include "tir/transforms/ir_utils.h"
 #include <iostream>
@@ -1272,6 +1273,13 @@ bool IsExprInvariantInVectorBoundary(const PrimExpr &expr, Var var,
 int MaxVectorLoadBits(const Target &target, bool global_only_access) {
   if (auto max_bits = target->GetAttr<Integer>("max_vector_bits")) {
     return static_cast<int>(max_bits.value()->value);
+  }
+  // RISC-V RVV: size vectors to the architectural vector register length so
+  // one iteration consumes a full vector register (LMUL=1).  The X100 runs
+  // VLEN=256, the A100 VLEN=1024; LLVM then maps the fixed vectors onto RVV
+  // registers with a single vsetvli per loop.
+  if (int vlen = RISCVVLenBits(target); vlen > 0) {
+    return vlen;
   }
   if (TargetSupportVectorize256(target) && !tl_config::Vectorize256Disabled() &&
       global_only_access) {
