@@ -9,6 +9,7 @@
 #include "ggml-spacemit/repack.h"
 #include "spert.hpp"
 #include <cstdlib>
+#include <cmath>
 #include <cstring>
 #include <algorithm>
 #include <vector>
@@ -99,5 +100,43 @@ extern "C" int ime2_gemv_q4_w(const void * packed, const float * x, float * y, i
         },
         qa[nw], x, a_row, packed, y, N, K, nw);
     fut.sync();
+    return 0;
+}
+
+// GQA attention for one query token. q:(nh,hd), KC/VC:(nkv,maxT,hd), out:(nh,hd).
+extern "C" int qwen_attn_fwd(const float * q, const float * KC, const float * VC,
+                             float * out, int nh, int nkv, int hd, int pos, int maxT) {
+    static float SC[16][8192];
+    if (nh > 16 || pos >= 8192 || pos >= maxT) return -3;
+    const float scale = 1.0f / sqrtf((float)hd);
+#pragma omp parallel for num_threads(8) schedule(static)
+    for (int h = 0; h < nh; ++h) {
+        const float * qh = q + (size_t)h * hd;
+        const float * kh = KC + (size_t)(h * nkv / nh) * maxT * hd;
+        const float * vh = VC + (size_t)(h * nkv / nh) * maxT * hd;
+        float * sc = SC[h];
+        for (int t = 0; t <= pos; ++t) {
+            const float * kt = kh + (size_t)t * hd;
+            float s = 0.0f;
+            for (int d = 0; d < hd; ++d) s += qh[d] * kt[d];
+            sc[t] = s * scale;
+        }
+        float mx = -1e30f;
+        for (int t = 0; t <= pos; ++t) mx = sc[t] > mx ? sc[t] : mx;
+        float sum = 0.0f;
+        for (int t = 0; t <= pos; ++t) {
+            float e = expf(sc[t] - mx);
+            sc[t] = e;
+            sum += e;
+        }
+        const float inv = 1.0f / sum;
+        float * oh = out + (size_t)h * hd;
+        for (int d = 0; d < hd; ++d) oh[d] = 0.0f;
+        for (int t = 0; t <= pos; ++t) {
+            const float w = sc[t] * inv;
+            const float * vt = vh + (size_t)t * hd;
+            for (int d = 0; d < hd; ++d) oh[d] += w * vt[d];
+        }
+    }
     return 0;
 }
