@@ -16,3 +16,5 @@ TileLang v0.1.15 RISC-V build notes (K3)
 12. Note: this is an extern-call prototype; T.gemm still has no RISC-V CPU lowering. Next: lower T.gemm to cblas for llvm target, then RVV codegen.
 
 13. Added tilelang.language.gemm_cblas(A,B,C,M,N,K): row-major f32 GEMM via cblas_sgemm, exported through tilelang.language. Intent: give the RISC-V/CPU target a usable GEMM primitive while tl.gemm CPU lowering is incomplete (fragment layout inference + multiple dyn shared alloc gaps). Host must preload libopenblas with RTLD_GLOBAL. Test: bench/riscv_gemm.py, 512^3, 3.943 ms / 68.08 GFLOPS, max_abs_err=0.0. References: OpenBLAS CBLAS API (BSD-3-Clause), TileLang MIT; no third-party code copied, only a public C API call.
+
+14. RVV codegen check: bench/rvv_add.py compiled with mattr +v emits vle32.v, vfadd.vv and vsetvli in the generated module (objdump on cached executable.so). N=4M f32 add: vec=1 5.718 ms (8.80 GB/s), vec=4 6.302 (7.99), vec=8 6.429 (7.83); all PASS. Add is bandwidth-bound on X100 (~9-10 GB/s measured), so vectorization does not help this kernel; RVV compute benefit is demonstrated by OpenBLAS GEMM (68 GFLOPS) instead.
