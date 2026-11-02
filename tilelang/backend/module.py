@@ -321,7 +321,21 @@ def create_backend_context(
     assert isinstance(normalized_target, Target)
 
     if target_host is None:
-        target_host = "llvm" if tvm.runtime.enabled("llvm") else "c"
+        # For riscv64 LLVM devices the host module must use the same triple and
+        # feature set (lp64d ABI). A bare "llvm" host defaults to soft-float and
+        # either fails to link (__addsf3) or crashes at call time.
+        _t = normalized_target
+        _mtriple = str(_t.attrs.get("mtriple", "") or "")
+        if _t.kind.name == "llvm" and _mtriple.startswith("riscv64"):
+            _mattr = [str(x) for x in (_t.attrs.get("mattr") or [])]
+            for _feat in ("+m", "+a", "+f", "+d"):
+                if _feat not in _mattr:
+                    _mattr.append(_feat)
+            target_host = {"kind": "llvm", "mtriple": _mtriple, "mattr": _mattr}
+            if _t.attrs.get("mcpu"):
+                target_host["mcpu"] = str(_t.attrs["mcpu"])
+        else:
+            target_host = "llvm" if tvm.runtime.enabled("llvm") else "c"
     normalized_target_host = Target(target_host)
     normalized_target = Target(normalized_target, normalized_target_host)
 

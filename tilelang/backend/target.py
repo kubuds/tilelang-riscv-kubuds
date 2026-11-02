@@ -127,8 +127,42 @@ def determine_target(target: TargetLike | Literal["auto"] = "auto", return_objec
     """
     if target == "auto":
         current_target = Target.current(allow_none=True)
-        return_var = current_target if current_target is not None else auto_detect_target()
+        if current_target is not None:
+            normalized = _normalize_registered_target(current_target)
+            return_var = normalized if normalized is not None else current_target
+        else:
+            return_var = auto_detect_target()
     else:
         return_var = _validate_manual_target(target)
 
     return _finalize_target(return_var, return_object=return_object)
+
+
+def _normalize_riscv_llvm(target):
+    """Ensure riscv64 LLVM targets use the lp64d ABI (+m,+a,+f,+d).
+
+    A bare ``llvm`` target on riscv64 otherwise defaults to a soft-float
+    module, which links/calls incorrectly against lp64d host objects
+    (observed as SIGSEGV in the llvm test suite).
+    """
+    try:
+        t = target if isinstance(target, Target) else Target(target)
+    except Exception:
+        return None
+    if t.kind.name != "llvm":
+        return None
+    mtriple = str(t.attrs.get("mtriple", "") or "")
+    if not mtriple.startswith("riscv64"):
+        return None
+    mattr = [str(x) for x in (t.attrs.get("mattr") or [])]
+    for feat in ("+m", "+a", "+f", "+d"):
+        if feat not in mattr:
+            mattr.append(feat)
+    cfg = {"kind": "llvm", "mtriple": mtriple, "mattr": mattr}
+    mcpu = t.attrs.get("mcpu")
+    if mcpu:
+        cfg["mcpu"] = str(mcpu)
+    return cfg
+
+
+register_target_normalizer("riscv-llvm-abi", _normalize_riscv_llvm)
