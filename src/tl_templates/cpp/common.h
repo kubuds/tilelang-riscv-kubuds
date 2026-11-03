@@ -110,3 +110,10 @@ inline vec_type<T, N> clamp(vec_type<T, N> x, vec_type<T, N> lo,
 }
 
 } // namespace tl
+
+// Vector element types referenced by the C codegen when it emits vectorised
+// copies (e.g. *(float4*)(ptr + off)) and broadcasts.  The template above
+// only provided the generic vec_type; the concrete names were missing, so any
+// kernel that vectorised a copy failed to compile on CPU/RISC-V targets.
+using float2 = vec_type<float, 2>;
+using float4 = vec_type<float, 4>;
