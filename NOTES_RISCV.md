@@ -1,5 +1,22 @@
 # RISC-V backend notes (step 2 blockers)
 
+## Correction to commit 4b1f7e56
+
+That commit reported "195x" for cblas over the TIR loop nest. The ratio is
+right for the kernel it measured, but that kernel is not a fair baseline:
+
+    bench_riscv_blas.py   T.Kernel(1), 512x512 locals   1014 ms
+    test_riscv_step1.py   T.Kernel(4,4), 128^3 tiles     231 ms
+    cblas_sgemm (either)                                   5.2 ms
+
+512x512 local arrays spill (1 MB of locals), which is why the single-block
+kernel is 4.4x slower. Against the tiled baseline the honest figure is
+
+    231 ms / 5.2 ms = 44x   (0.26 -> 51.75 GFLOP/s compares against the
+                             spilling kernel and overstates it at 195x)
+
+Quote 44x unless the naive kernel is explicitly the subject.
+
 ## Verified
 
 RV64GC baseline (commit 739bbb1e): 512^3 fp32, max rel 2.77e-07 vs torch,
