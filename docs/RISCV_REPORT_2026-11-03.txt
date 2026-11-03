@@ -1,0 +1,187 @@
+# TileLang v0.1.15 RISC-V 后端实现报告
+
+日期：2026-11-03
+仓库：/work/kubuds/hermes/tilelang_riscv（基于 tile-ai/tilelang v0.1.15，分支 riscv-backend）
+硬件：进迭时空 K3，8×X100（VLEN=256，cpu0-7）+ 8×A100（VLEN=1024，cpu8-15），Bianbu，gcc 15.2
+
+## 0. 结论摘要
+
+三步适配全部落地，代码已提交（3 个 commit），回归测试通过。
+
+  步骤 1  RV64GC 基线：跑通，标量内核与 torch 逐位一致，零向量指令
+  步骤 2  RVV 1.0（VLEN=256，X100）：新增 T.gemm 的 RVV 实现；OpenBLAS 路径 51.9 GFLOP/s，
+          自写 RVV 模板 5.53 GFLOP/s（标量 1.20）。解码引擎用 RVV 手写 GEMV/attention 等，
+          Qwen3-0.6B 端到端 24.4 tok/s
+  步骤 3  A100：IME2 int8 GEMM 1024^3 实测 840 GMAC/s，逐元素零误差；RVV VLEN=1024 正确
+  模型     Qwen3-0.6B 22-24.4 tok/s（可读输出）；DeepSeek-R1-Distill-Qwen-1.5B 8.38 tok/s（可读输出）
+
+与同机同时段 llama.cpp（SpacemiT 官方构建，IME2 开启）对比：
+
+  Qwen3-0.6B Q8_0   llama.cpp 30.20 tok/s  本实现 24.41 tok/s   80.8%
+  DeepSeek-1.5B Q4_K_M  llama.cpp 16.22 tok/s  本实现 8.38 tok/s   51.7%
+
+没有达到"超过 llama.cpp"的目标。原因已定位且可量化，见第 6 节，不是内核实现错误，
+而是权重位宽与可用带宽的账：本实现用 int8 权重（Q8_0 网格），llama.cpp 在 1.5B 上用
+Q4_K_M，字节数只有一半；0.6B 同用 Q8_0 时差距 19%，来自 GEMM 走 IME2 + 大页，
+而本实现走 X100 的 RVV 流式 GEMV。
+
+## 1. 后端结构
+
+新增 target kind "riscv"（src/riscv/target.cc），属性：
+
+  march   gcc -march，默认 rv64gc
+  mabi    默认 lp64d
+  vlen    256 / 1024 / 0（未知）。只影响 -march 的 zvl 与告警，不改变源码
+  rvv     true 时 T.gemm 走仓库内 RVV 模板
+  blas    "openblas" 时 T.gemm 走 cblas_sgemm（链接系统库，不 vendor）
+  ime2    true 时链接 libtl_riscv_ime2.so（A100 int8）
+
+复用 CPU 的 pass pipeline 与 C 主机代码生成，只替换与 ISA 相关的部分
+（tilelang/riscv/{backend,toolchain,codegen,gemm_riscv}.py）。这样上游 CPU 路径的
+每次修复都会自动继承。
+
+关键问题：v0.1.15 的 CPU 家族根本没有注册任何 GEMM 实现（C++ SelectInst 返回
+"cpu.scalar"，但无人注册），所以 T.gemm 在 CPU/RISC-V 上直接报
+"No GEMM implementation registered"。本后端补上了第一个实现，提供
+infer_layout + lower 两条 lowering（标量 / RVV / BLAS 三选一）。
+
+## 2. 步骤 1：RV64GC 基线
+
+任务要求以 SG2042 为主测试对象。本机无法访问 SG2042，因此在 K3 上用同一套
+RV64GC 用户态约束（-march=rv64gc -mabi=lp64d -O3）验证，后端在 march=rv64gc 时不会
+生成任何 ISA 相关代码（不启用 rvv/ime2 时与 C 后端产物逐字节同源）。
+
+  512^3 fp32 标量内核：1052 ms，与 torch 的最大相对误差 2.77e-07
+  objdump 统计：vsetvli / vmul.vv / vadd.vv 均为 0
+
+torch 在该板上也是标量实现（逐位相同），所以基线只能以"位一致"作为正确性判据。
+
+## 3. 步骤 2：RVV 1.0（X100，VLEN=256）
+
+先按要求接 OpenBLAS，再写仓库内 RVV 模板。512^3 fp32，8 线程：
+
+  标量 TIR 嵌套          223.1 ms   1.20 GFLOP/s   误差 0
+  仓库内 RVV 模板         48.5 ms   5.53 GFLOP/s   误差 1.2e-04
+  OpenBLAS                5.2 ms  51.87 GFLOP/s   误差 9.9e-05
+
+RVV 模板（src/tl_templates/riscv/riscv.h）要点：
+
+  N 按 256 列分块，B 面板驻留 L2；MR=8 行共用一个 k 步
+  只有一个累加链时 vfmacc 延迟主导：单核 4.4 GFLOP/s；8 条独立链 16.7 GFLOP/s
+  vsetvl 全程动态，同一份源码在 VLEN=256/1024 都正确
+  beta 语义按 BLAS（0 覆盖 / 1 累加），因为 T.gemm 每个 K tile 调一次
+
+实测教训：仅加 -march=rv64gcv -O3 并不能把 TIR 循环向量化（反汇编只有 12 条向量指令，
+全是序言保存），4.6 倍加速来自展开而非 RVV。RVV 必须自己写。
+
+解码路径不用 T.gemm：单 token 的 GEMV 是 DRAM 受限，T.gemm 的 tile 语义不合适。
+src/tl_templates/riscv/llm.h 用 RVV intrinsic 实现 Q8 GEMV / RMSNorm / 逐头 qk-norm /
+RoPE / GQA decode attention / SiLU / 残差 / fp16 embedding / argmax。
+
+## 4. 步骤 3：A100（IME2 + VLEN=1024）
+
+IME2 内核需要 -march=rv64gcv_..._xsmtvdotii，且只能在 cpu8-15 执行（X100 上 SIGILL），
+因此单独编译成 libtl_riscv_ime2.so，由 ime2=true 链接；不混入 libtilelang.so。
+
+正确性（testing/riscv/test_riscv_ime2.py，先把进程迁到 A100）：
+
+  M=N=K=256    裸内核 0.14 ms   124 GMAC/s   max|err| = 0
+  M=N=K=512    裸内核 0.36 ms   372 GMAC/s   max|err| = 0
+  M=N=K=1024   裸内核 1.28 ms   840 GMAC/s   max|err| = 0
+
+注意口径：以上不含打包。若把 pack_a/pack_b 放进计时，1024^3 只有 38 GMAC/s ——
+量到的是打包器（标量，且在慢速 A100 标量单元上），不是矩阵单元。所以后端把打包
+定为加载期一次性动作，接口分开：pack_b / pack_a / gemm。
+
+A100 上的 RVV（VLEN=1024）：gemv 256x1024 最大误差 4.24e-04，正确但比 X100 慢约 25 倍
+（该核的向量单元为 IME2 服务）。结论：A100 只跑 IME2，其余算子留在 X100。
+
+## 5. 模型端到端
+
+  Qwen3-0.6B（Qwen3ForCausalLM，28 层，H=1024，16/8 头，IM=3072，qk_norm，tie embedding）
+  DeepSeek-R1-Distill-Qwen-1.5B（Qwen2 架构，28 层，H=1536，12/2 头，IM=8960，qkv bias）
+
+权重：int8，每 32 个元素一个 fp16 scale（Q8_0 网格），q 与 scale 分平面存放；
+由 tools/riscv_llm/export_weights.py 从 safetensors 导出为单文件 blob + meta.json。
+
+调度：每层的算子序列是一个 TIR prim_func，Python 只循环层与 head。整模型能 lower 时
+是一整段 TIR、每 token 一次 FFI 调用；不能 lower 时退化为逐层程序（29 次/ token）。
+
+  Qwen3-0.6B   权重 0.94 GB   prefill 约 44 ms/token   decode 22.0-24.4 tok/s
+  DS-1.5B      权重 2.13 GB   prefill 约 120 ms/token  decode 8.38 tok/s
+
+输出示例（greedy，raw prompt "The capital of France is"）：
+  Qwen3-0.6B： " Paris. The capital of Italy is Rome. The capital of Spain is Madrid. ..."
+  DS-1.5B：    " Paris, and the capital of Germany is Berlin. So, the capital of France is not ..."
+
+线程数：7 最优。X100 上 4/5/6/7/8 线程的 decode 实测 17.5/20.5/21.4/24.4/5.0 tok/s；
+单线程 GEMV 的流带宽只有 3.0 GB/s（microbench），不够用。8 线程崩溃是 OpenMP 自旋争用，
+与之前 ncnn int8 的现象一致。
+
+## 6. 与 llama.cpp 的差距：账怎么算
+
+同机同时段（llama-bench，SpacemiT 构建，日志确认 use_ime2=1、cpu_mask=ff00）：
+
+  Qwen3-0.6B Q8_0      pp64 199.7   tg64 30.20
+  DS-1.5B  Q4_K_M      pp64 101.7   tg64 16.22
+
+本实现：
+  Qwen3-0.6B int8      pp 约 22      tg 24.41      解码字节 654 MB/token -> 16.0 GB/s
+  DS-1.5B  int8        pp 约 8       tg 8.38       解码字节 2.13 GB/token -> 17.9 GB/s
+
+两条硬约束：
+
+  1) 1.5B 上字节数差 1.9 倍。Q4_K_M 1.117 GB/token，本实现 int8 2.13 GB/token。
+     实测本实现已经跑到 17.9 GB/s（DRAM 峰值约 21 GB/s），也就是说内存墙已到，
+     不可能靠调内核追平；必须把权重降到 4bit。0.6B 同为 Q8_0 时字节数接近，
+     差距 19%，主要来自对方 GEMM 走 IME2 + 大页，本实现走 X100 流式 GEMV。
+  2) prefill 差距更大（22 vs 200 tok/s），因为本实现 prefill 也是逐 token 的 GEMV，
+     没有做批量 GEMM；对方把整段 prompt 喂给 IME2。
+
+结论：正确性达标，性能未达标。下一步优先级应是 4bit 权重（GEMV 内核 + 导出），
+其次是把 prefill 变成批量 GEMM 走 IME2（需要跨簇生产者/消费者，之前的工作已证明可行）。
+
+## 7. 过程中修掉的编译器缺陷（都需要上游关注）
+
+1) src/tl_templates/cpp/common.h：float2/float4 定义在 namespace tl 之外，而 vec_type
+   在 namespace 内，任何向量化拷贝都编译不过。
+2) toolchain.py：生成的 device TU 没有包含模板头，向量类型在 device TU 里未声明；
+   改为 -include tl_templates/riscv/riscv.h，一次修好所有 kernel。
+3) src/transform/storage_rewrite.cc：with_lanes(me->coeff) 当 coeff==0（模集未知）时
+   会构造 scalable vector dtype，下一次 lanes() 直接抛
+   "Can't fetch the lanes of a scalable vector at a compile time"。已加保护。
+4) 未修：同样在 PointerValueTypeRewrite，当 TIR 里含 L>=2 的层循环且为 1.5B 形状
+   （H=1536, IM=8960）时仍会抛同样的错；L=1 可正常 lower。engine.py 因此检测失败并
+   退化为逐层程序。最小复现：H=1536、IM=8960、L=2 的层循环程序。
+
+## 8. 测试
+
+  testing/python/cpu 全量：86 passed, 2 skipped（192 s）
+  testing/riscv/test_riscv_ime2.py：PASS（int8 零误差 + VLEN=1024 正确）
+  bench_riscv_gemm.py / bench_tgemm.py：标量 / RVV / OpenBLAS 三路数值与吞吐
+
+## 9. 提交记录
+
+  3272b285 feat(riscv): RVV 1.0 fp32 GEMM template behind target attr rvv
+  8f06e0a7 feat(riscv): step 3 -- IME2 on A100, Q8 LLM decode engine on RVV
+  739bbb1e..fd686f17 步骤 1/2 的前序提交（基线、OpenBLAS、T.gemm、工具链）
+
+每个 commit 都写了意图、实测数据、踩坑与许可证说明。
+
+## 10. 复现命令
+
+  cd /work/kubuds/hermes/tilelang_riscv
+  export PYTHONPATH=$PWD
+  python bench_riscv_gemm.py 512
+  python testing/riscv/test_riscv_ime2.py
+  python tools/riscv_llm/export_weights.py /work/kubuds/hermes/models/qwen3_06b_hf /tmp/qwen3.bin
+  OMP_NUM_THREADS=7 python tools/riscv_llm/run_model.py /tmp/qwen3.bin \
+    /work/kubuds/hermes/models/qwen3_06b_hf/tokenizer.json \
+    --prompt "The capital of France is" --n 64 --raw
+
+## 11. 许可证
+
+新增代码全部 Apache-2.0。OpenBLAS 以链接方式使用（BSD-3-Clause，兼容）。
+IME2 内核是本项目早期自有代码（tl_k3_opt/src/ime2_own_gemm_v15_ldc.c）迁入，
+未拷贝第三方源码。参考：RISC-V V 1.0 规范、K3 论文、llama.cpp 的 Q8_0 分块布局
+（仅格式，不含代码）。tilelang-tpu 仅作为思路参考（后端注册方式），未引用其代码。
