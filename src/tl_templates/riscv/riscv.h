@@ -189,4 +189,10 @@ static inline int32_t tl_riscv_gemm_f32(int32_t M, int32_t N, int32_t K,
 
 } // extern "C"
 
+/* The LLM primitives (GEMV, RMSNorm, RoPE, attention) are header-only and
+ * only reachable through T.call_extern from the tilelang/riscv/llm driver;
+ * pulling them in here keeps the toolchain to a single -include. */
+#include "tl_templates/riscv/llm.h"
+#include "tl_templates/riscv/ime2.h"
+
 #endif // TL_TEMPLATES_RISCV_RISCV_H_

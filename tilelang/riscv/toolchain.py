@@ -85,8 +85,18 @@ def get_compile_flags(target: Target) -> list[str]:
         flags.append("-mrvv-vector-bits=zvl")
 
     if bool(target.attrs.get("ime2", False)):
-        # Consumed by the IME2 templates added in step 3.
+        # Step 3: the IME2 kernel is a separate shared library because it must
+        # be compiled with -march=..._xsmtvdotii, an extension that every other
+        # TileLang kernel must not inherit (it changes the assembler's view of
+        # the ISA and has no business in the RVV fallback).
+        lib_dir = Path(__file__).resolve().parents[2] / "build" / "lib"
         flags.append("-DTL_RISCV_IME2=1")
+        flags += [
+            "-Wl,--no-as-needed",
+            f"-L{lib_dir}",
+            "-ltl_riscv_ime2",
+            f"-Wl,-rpath,{lib_dir}",
+        ]
 
     blas = _attr_str(target, "blas", "")
     if blas:

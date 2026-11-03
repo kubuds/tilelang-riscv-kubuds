@@ -1564,7 +1564,14 @@ public:
       const PrimExpr last_dim_index = indices[indices.size() - 1];
       if (last_dim_index.dtype().lanes() == 1) {
         arith::ModularSet me = analyzer_.modular_set(last_dim_index);
-        var_info.scalar_read_dtype.emplace(access_dtype.with_lanes(me->coeff));
+        // me->coeff == 0 means "unknown modular set", not "zero lanes".
+        // with_lanes(0) encodes a *scalable* vector in DataType, and the next
+        // lanes() call on it throws ("Can't fetch the lanes of a scalable
+        // vector at a compile time").  Seen on a scalar read of a >2GB
+        // parameter whose index the analyzer cannot bound.
+        if (me->coeff > 0) {
+          var_info.scalar_read_dtype.emplace(access_dtype.with_lanes(me->coeff));
+        }
         return;
       }
     }
