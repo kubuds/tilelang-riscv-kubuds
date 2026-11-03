@@ -67,6 +67,10 @@ def get_compile_flags(target: Target) -> list[str]:
     # instructions at rv64gcv).  -O3 enables the loop vectoriser; -ffast-math
     # is deliberately NOT used because it would change numerics.
     flags += ["-O3", "-ftree-vectorize"]
+    # The device translation unit (lib0.c) does not include the templates
+    # header -- only the host unit does -- so vector types such as float4 are
+    # undeclared there.  -include forces the header into every TU.
+    flags += ["-include", "tl_templates/cpp/common.h"]
 
     # Only pin the vector width when the caller actually knows it.  An unknown
     # VLEN must stay unspecified so the compiler can emit VLEN-agnostic code.
