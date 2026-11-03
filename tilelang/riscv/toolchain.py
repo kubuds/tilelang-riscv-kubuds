@@ -48,6 +48,15 @@ def get_compile_flags(target: Target) -> list[str]:
 
     march = _attr_str(target, "march", "rv64gc")
     mabi = _attr_str(target, "mabi", "lp64d")
+
+    # GCC has no numeric form for -mrvv-vector-bits: it accepts only
+    # "scalable" or "zvl", and the concrete width comes from the Zvl*b
+    # extension in -march.  (Clang would take =zvl256, GCC does not.)  Pinning
+    # the width is what keeps an X100 kernel (VLEN=256) from being silently
+    # reused on an A100 (VLEN=1024).
+    vlen = int(target.attrs.get("vlen", 0))
+    if vlen and f"zvl{vlen}b" not in march:
+        march = f"{march}_zvl{vlen}b"
     # tl_templates/ lives under <repo>/src; the generated C includes it by
     # relative path, so the host compile must see it.  The CPU backend gets
     # this from its own include list; the riscv kind is a new kind, so it has
@@ -57,9 +66,8 @@ def get_compile_flags(target: Target) -> list[str]:
 
     # Only pin the vector width when the caller actually knows it.  An unknown
     # VLEN must stay unspecified so the compiler can emit VLEN-agnostic code.
-    vlen = int(target.attrs.get("vlen", 0))
     if vlen:
-        flags.append(f"-mrvv-vector-bits=zvl{vlen}")
+        flags.append("-mrvv-vector-bits=zvl")
 
     if bool(target.attrs.get("ime2", False)):
         # Consumed by the IME2 templates added in step 3.
