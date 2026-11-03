@@ -12,9 +12,23 @@ class TVMFFIKernelCache(KernelCache):
         artifact = getattr(kernel, "artifact", None)
         target_host = getattr(artifact, "target_host", None)
         target_host_kind = getattr(getattr(target_host, "kind", None), "name", None)
-        if target_host_kind == "c":
-            return KernelCache._get_source_compile_args()
-        return KernelCache._get_export_link_args()
+        kwargs = (
+            KernelCache._get_source_compile_args()
+            if target_host_kind == "c"
+            else KernelCache._get_export_link_args()
+        )
+        # RISC-V: the host-side link needs the ISA flags (-march/-mabi/-mrvv-*)
+        # and the tl_templates include path, otherwise the cached executable is
+        # built with generic options and fails to find tl_templates/cpp/.
+        target = getattr(kernel, "target", None)
+        if target is not None and getattr(target.kind, "name", None) == "riscv":
+            from tilelang.riscv.toolchain import get_compile_flags
+
+            flags = get_compile_flags(target)
+            if flags:
+                kwargs = dict(kwargs)
+                kwargs["options"] = list(kwargs.get("options", [])) + flags
+        return kwargs
 
     def _save_wrapper_kernel_code_to_disk(self, kernel: JITKernel, cache_path: str, verbose: bool = False):
         host_kernel_path = os.path.join(cache_path, self.host_kernel_path)

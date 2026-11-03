@@ -105,8 +105,11 @@ def main() -> int:
 
     ref = torch.matmul(a.float(), b.float())
     diff = (c.float() - ref).abs()
-    denom = ref.abs().clamp_min(1e-3)
-    rel = (diff / denom).max().item()
+    # Relative to the tensor scale, not per element: a per-element ratio is
+    # meaningless when the reference is near zero, which happens for every
+    # random GEMM and made earlier runs look like failures.
+    scale = ref.abs().max().clamp_min(1e-6).item()
+    rel = diff.max().item() / scale
     print(f"   run: {t_run * 1e3:.1f} ms   max abs {diff.max().item():.4e}   max rel {rel:.3e}")
 
     # RV64GC baseline must be scalar.  Count vector instructions.
@@ -119,7 +122,7 @@ def main() -> int:
     else:
         print("   object: not found (cache miss)")
 
-    ok = rel < 5e-3
+    ok = rel < 1e-3
     print("== RESULT:", "PASS" if ok else "FAIL")
     return 0 if ok else 1
 

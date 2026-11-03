@@ -784,7 +784,17 @@ class JITKernel(Generic[_P, _T]):
             os.makedirs(dir_path, exist_ok=True)
 
         if runtime_module is not None:
-            runtime_module.export_library(kernel_file)
+            export_kwargs = {}
+            if self.target.kind.name == "riscv":
+                # export_library() calls tvm.contrib.cc directly and
+                # would otherwise drop the ISA flags derived from the
+                # target; see tilelang/riscv/toolchain.py.
+                from tilelang.riscv.toolchain import get_compile_flags as get_riscv_flags
+
+                flags = get_riscv_flags(self.target)
+                if flags:
+                    export_kwargs["options"] = flags
+            runtime_module.export_library(kernel_file, **export_kwargs)
         elif not (os.path.exists(kernel_file) and os.path.samefile(cached_library, kernel_file)):
             shutil.copyfile(cached_library, kernel_file)
         logger.info(f"Kernel library exported to {os.path.abspath(kernel_file)}")
