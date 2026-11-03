@@ -19,7 +19,13 @@ namespace cpu {
 struct Fill {
   static Stmt Lower(const FillNode &op, const LowerArgs &lower_args,
                     arith::Analyzer *analyzer) {
-    if (IsLocalBuffer(op.dst, true) || IsGlobalBuffer(op.dst)) {
+    // Fragments are thread-local register tiles with a layout; CPU fill
+    // handles them like locals because MakeSIMTLoop walks logical indices and
+    // VectorizeLoop consults layout_map.  Rejecting the scope was an
+    // oversight, not a design choice: it made T.clear() unusable on any
+    // fragment, which is the first thing every T.gemm kernel does.
+    const bool is_fragment = op.dst.scope() == "local.fragment";
+    if (IsLocalBuffer(op.dst, true) || IsGlobalBuffer(op.dst) || is_fragment) {
       auto init_loop = op.MakeSIMTLoop(analyzer);
       auto vectorized_loop =
           VectorizeLoop(init_loop, analyzer, lower_args.layout_map);
