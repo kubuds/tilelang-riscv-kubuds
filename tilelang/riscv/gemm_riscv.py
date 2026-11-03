@@ -61,6 +61,15 @@ class RiscvGemm(GemmBase):
     def _blas_enabled(self, target: Target) -> bool:
         return str(target.attrs.get("blas", "")) == "openblas"
 
+    def _rvv_enabled(self, target: Target) -> bool:
+        """True when the caller asked for the in-tree RVV GEMM.
+
+        Kept separate from ``blas``: OpenBLAS wins on throughput, the RVV
+        template is the fallback that needs no external library and is the
+        only fp32 GEMM available on a bare rv64gcv userland.
+        """
+        return bool(target.attrs.get("rvv", False))
+
     def lower(
         self,
         layout_map: dict,
@@ -107,6 +116,27 @@ class RiscvGemm(GemmBase):
                 )
 
             return _gemm_blas
+
+        if self._rvv_enabled(target):
+
+            @T.prim_func
+            def _gemm_rvv() -> None:
+                T.call_extern(
+                    "int32",
+                    "tl_riscv_gemm_f32",
+                    M,
+                    N,
+                    K,
+                    T.address_of(A_buf[tuple(r.min for r in A_r.region[:-2]) + (a0, a1)]),
+                    a_cols,
+                    T.address_of(B_buf[tuple(r.min for r in B_r.region[:-2]) + (b0, b1)]),
+                    b_cols,
+                    T.address_of(C_buf[tuple(r.min for r in C_r.region[:-2]) + (c0, c1)]),
+                    c_cols,
+                    0 if clear_accum else 1,
+                )
+
+            return _gemm_rvv
 
         @T.prim_func
         def _gemm_scalar() -> None:

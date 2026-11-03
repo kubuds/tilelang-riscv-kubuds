@@ -69,8 +69,15 @@ def get_compile_flags(target: Target) -> list[str]:
     flags += ["-O3", "-ftree-vectorize"]
     # The device translation unit (lib0.c) does not include the templates
     # header -- only the host unit does -- so vector types such as float4 are
-    # undeclared there.  -include forces the header into every TU.
-    flags += ["-include", "tl_templates/cpp/common.h"]
+    # undeclared there.  -include forces the header into every TU.  The
+    # riscv.h entry header pulls in the generic cpp/common.h and adds the
+    # RVV primitives, so kernels can call tl_riscv_* from any lowering.
+    flags += ["-include", "tl_templates/riscv/riscv.h"]
+
+    # Kernels in tl_templates/riscv use `#pragma omp parallel for`; without
+    # -fopenmp those pragmas are silently ignored and every GEMV/GEMM runs on
+    # one thread (measured 6-8x slower on the LLM decode path).
+    flags.append("-fopenmp")
 
     # Only pin the vector width when the caller actually knows it.  An unknown
     # VLEN must stay unspecified so the compiler can emit VLEN-agnostic code.

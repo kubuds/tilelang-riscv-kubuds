@@ -60,6 +60,11 @@ TVM_REGISTER_TARGET_KIND("riscv", kDLCPU)
     // SpacemiT IME2 matrix unit.  Off by default: enabling it changes the
     // numeric path, so it must be an explicit opt-in.
     .add_attr_option<bool>("ime2", refl::DefaultValue(false))
+    // Use the in-tree RVV GEMM template (tl_riscv_gemm_f32) when T.gemm is
+    // lowered.  Default off: OpenBLAS is faster, so callers opt in either by
+    // setting blas="openblas" (measured 44x over the scalar nest) or by
+    // setting rvv=true on a machine without a BLAS.
+    .add_attr_option<bool>("rvv", refl::DefaultValue(false))
     // Optional BLAS to link when T.gemm is lowered to a vendor call ("openblas").
     // Empty means "pure generated code".  Linked, never vendored: OpenBLAS is
     // BSD-3-Clause, compatible with this repository's Apache-2.0 licence.
