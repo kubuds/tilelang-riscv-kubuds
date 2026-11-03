@@ -24,6 +24,8 @@ every layer (only BASE changes).
 
 from __future__ import annotations
 
+import os
+
 import json
 import time
 from dataclasses import dataclass
@@ -298,6 +300,122 @@ def build_layer(m: Meta, maxseq: int):
     return layer
 
 
+def build_layer_m8(m: Meta, maxseq: int, MR: int = 8):
+    """Same layer, MR prompt tokens at a time (prefill only).
+
+    Every linear layer reads its weights once for MR rows instead of once per
+    token.  Attention stays per row so the causal order inside the chunk is
+    preserved: row r's KV is written before row r attends, and it sees only
+    positions <= its own.
+    """
+    H, NH, NKV, HD, IM = m.H, m.NH, m.NKV, m.HD, m.IM
+    NQ, KVD = m.NQ, m.KV
+    eps = m.eps
+    o = m.layer_off
+    scale = 1.0 / (HD ** 0.5)
+    GEMV = "tl_riscv_gemv_q4" if m.wbits == 4 else "tl_riscv_gemv_q8_m8"
+
+    @T.prim_func
+    def layer(
+        W: T.Tensor((m.nbytes,), "uint8"),
+        CS: T.Tensor((maxseq, HD // 2), "float32"),
+        SN: T.Tensor((maxseq, HD // 2), "float32"),
+        KC: T.Tensor((m.L * NKV * maxseq * HD,), "float32"),
+        VC: T.Tensor((m.L * NKV * maxseq * HD,), "float32"),
+        X: T.Tensor((MR * H,), "float32"),
+        XB: T.Tensor((MR * H,), "float32"),
+        Q: T.Tensor((MR * NQ,), "float32"),
+        KB: T.Tensor((MR * KVD,), "float32"),
+        VB: T.Tensor((MR * KVD,), "float32"),
+        ATT: T.Tensor((MR * NQ,), "float32"),
+        GUG: T.Tensor((MR * IM,), "float32"),
+        GUU: T.Tensor((MR * IM,), "float32"),
+        POS: T.Tensor((1,), "int32"),
+        BASE: T.Tensor((1,), "int64"),
+        LI: T.Tensor((1,), "int32"),
+    ):
+        with T.Kernel(1):
+            b = BASE[0]
+            l = LI[0]
+            for mm in range(MR):
+                _call("tl_riscv_rmsnorm", H, T.address_of(X[mm * H]),
+                      T.address_of(W[T.cast(b + o["rms_attn"], "int64")]), eps,
+                      T.address_of(XB[mm * H]))
+            _call(GEMV, NQ, H, T.address_of(W[T.cast(b + o["wq.q"], "int64")]),
+                  T.address_of(W[T.cast(b + o["wq.s"], "int64")]),
+                  T.address_of(XB[0]), T.address_of(Q[0]))
+            _call(GEMV, KVD, H, T.address_of(W[T.cast(b + o["wk.q"], "int64")]),
+                  T.address_of(W[T.cast(b + o["wk.s"], "int64")]),
+                  T.address_of(XB[0]), T.address_of(KB[0]))
+            _call(GEMV, KVD, H, T.address_of(W[T.cast(b + o["wv.q"], "int64")]),
+                  T.address_of(W[T.cast(b + o["wv.s"], "int64")]),
+                  T.address_of(XB[0]), T.address_of(VB[0]))
+            if m.has_bias:
+                for mm in range(MR):
+                    _call("tl_riscv_add_u8", NQ, T.address_of(Q[mm * NQ]),
+                          T.address_of(W[T.cast(b + o["qkv_bias"], "int64")]))
+                    _call("tl_riscv_add_u8", KVD, T.address_of(KB[mm * KVD]),
+                          T.address_of(W[T.cast(b + o["qkv_bias"] + NQ * 4, "int64")]))
+                    _call("tl_riscv_add_u8", KVD, T.address_of(VB[mm * KVD]),
+                          T.address_of(W[T.cast(b + o["qkv_bias"] + (NQ + KVD) * 4, "int64")]))
+            for mm in range(MR):
+                for h in range(NH):
+                    if m.has_qk_norm:
+                        _call("tl_riscv_head_norm", HD,
+                              T.address_of(Q[mm * NQ + h * HD]),
+                              T.address_of(W[T.cast(b + o["q_norm"], "int64")]), eps)
+                    _call("tl_riscv_rope", HD, T.address_of(Q[mm * NQ + h * HD]),
+                          T.address_of(CS[POS[0] + mm, 0]),
+                          T.address_of(SN[POS[0] + mm, 0]))
+                for h in range(NKV):
+                    if m.has_qk_norm:
+                        _call("tl_riscv_head_norm", HD,
+                              T.address_of(KB[mm * KVD + h * HD]),
+                              T.address_of(W[T.cast(b + o["k_norm"], "int64")]), eps)
+                    _call("tl_riscv_rope", HD, T.address_of(KB[mm * KVD + h * HD]),
+                          T.address_of(CS[POS[0] + mm, 0]),
+                          T.address_of(SN[POS[0] + mm, 0]))
+            for mm in range(MR):
+                for h in range(NKV):
+                    _call("tl_riscv_copy", HD,
+                          T.address_of(KC[((l * NKV + h) * maxseq + POS[0] + mm) * HD]),
+                          T.address_of(KB[mm * KVD + h * HD]))
+                    _call("tl_riscv_copy", HD,
+                          T.address_of(VC[((l * NKV + h) * maxseq + POS[0] + mm) * HD]),
+                          T.address_of(VB[mm * KVD + h * HD]))
+                _call("tl_riscv_attn_decode", NH, m.nkv_attn, HD, POS[0] + mm,
+                      maxseq * HD, scale, T.address_of(Q[mm * NQ]),
+                      T.address_of(KC[l * NKV * maxseq * HD]),
+                      T.address_of(VC[l * NKV * maxseq * HD]),
+                      T.address_of(ATT[mm * NQ]))
+            _call(GEMV, H, NQ, T.address_of(W[T.cast(b + o["wo.q"], "int64")]),
+                  T.address_of(W[T.cast(b + o["wo.s"], "int64")]),
+                  T.address_of(ATT[0]), T.address_of(XB[0]))
+            for mm in range(MR):
+                _call("tl_riscv_add", H, T.address_of(X[mm * H]),
+                      T.address_of(XB[mm * H]))
+                _call("tl_riscv_rmsnorm", H, T.address_of(X[mm * H]),
+                      T.address_of(W[T.cast(b + o["rms_ffn"], "int64")]), eps,
+                      T.address_of(XB[mm * H]))
+            _call(GEMV, IM, H, T.address_of(W[T.cast(b + o["wgate.q"], "int64")]),
+                  T.address_of(W[T.cast(b + o["wgate.s"], "int64")]),
+                  T.address_of(XB[0]), T.address_of(GUG[0]))
+            _call(GEMV, IM, H, T.address_of(W[T.cast(b + o["wup.q"], "int64")]),
+                  T.address_of(W[T.cast(b + o["wup.s"], "int64")]),
+                  T.address_of(XB[0]), T.address_of(GUU[0]))
+            for mm in range(MR):
+                _call("tl_riscv_silu_mul", IM, T.address_of(GUG[mm * IM]),
+                      T.address_of(GUU[mm * IM]), T.address_of(GUG[mm * IM]))
+            _call(GEMV, H, IM, T.address_of(W[T.cast(b + o["wdown.q"], "int64")]),
+                  T.address_of(W[T.cast(b + o["wdown.s"], "int64")]),
+                  T.address_of(GUG[0]), T.address_of(XB[0]))
+            for mm in range(MR):
+                _call("tl_riscv_add", H, T.address_of(X[mm * H]),
+                      T.address_of(XB[mm * H]))
+
+    return layer
+
+
 def build_head(m: Meta):
     H, V = m.H, m.V
     GEMV = "tl_riscv_gemv_q4" if m.wbits == 4 else "tl_riscv_gemv_q8"
@@ -350,6 +468,16 @@ class Engine:
         self.base = np.zeros(1, dtype=np.int64)
         self.li = np.zeros(1, dtype=np.int32)
         self.ids = np.zeros(1, dtype=np.int32)
+        # prefill batch buffers (MR=8 rows)
+        self.MR = 8
+        self.x8 = np.zeros(self.MR * m.H, dtype=np.float32)
+        self.xb8 = np.zeros(self.MR * m.H, dtype=np.float32)
+        self.q8b = np.zeros(self.MR * m.NQ, dtype=np.float32)
+        self.kb8 = np.zeros(self.MR * m.KV, dtype=np.float32)
+        self.vb8 = np.zeros(self.MR * m.KV, dtype=np.float32)
+        self.att8 = np.zeros(self.MR * m.NQ, dtype=np.float32)
+        self.gug8 = np.zeros(self.MR * m.IM, dtype=np.float32)
+        self.guu8 = np.zeros(self.MR * m.IM, dtype=np.float32)
         self.posn = 0
         self.last_prefill_s = 0.0
         self.last_decode_s = 0.0
@@ -377,8 +505,19 @@ class Engine:
                 self.f_layer = tilelang.compile(build_layer(m, maxseq),
                                                 out_idx=None,
                                                 execution_backend="tvm_ffi")
-                self.f_head = tilelang.compile(build_head(m), out_idx=None,
-                                               execution_backend="tvm_ffi")
+            # the head is also used by the batched prefill path, so compile it
+            # even when the whole-model program exists.
+            self.f_head = tilelang.compile(build_head(m), out_idx=None,
+                                           execution_backend="tvm_ffi")
+            self.f_layer_m8 = None
+            try:
+                if os.environ.get("TL_NO_BATCH"):
+                    raise RuntimeError("batched prefill disabled by TL_NO_BATCH")
+                self.f_layer_m8 = tilelang.compile(build_layer_m8(m, maxseq),
+                                                   out_idx=None,
+                                                   execution_backend="tvm_ffi")
+            except Exception as exc:  # noqa: BLE001
+                print(f"[engine] batched prefill unavailable ({exc})", flush=True)
         self.build_s = time.time() - t0
 
     def _embed(self, tok: int):
@@ -388,6 +527,28 @@ class Engine:
             self.w[m.embed + tok * m.H * 2: m.embed + (tok + 1) * m.H * 2],
             dtype=np.float16)
         self.x[:] = row
+
+    def _embed_row(self, dst: np.ndarray, row: int, tok: int):
+        m = self.m
+        dst[row * m.H:(row + 1) * m.H] = np.frombuffer(
+            self.w[m.embed + tok * m.H * 2: m.embed + (tok + 1) * m.H * 2],
+            dtype=np.float16)
+
+    def _prefill_chunk(self, chunk: list[int], base_pos: int) -> int:
+        m = self.m
+        for i, t in enumerate(chunk):
+            self._embed_row(self.x8, i, t)
+        self.pos[0] = base_pos
+        for l in range(m.L):
+            self.base[0] = m.layer_base + l * m.layer_stride
+            self.li[0] = l
+            self.f_layer_m8(self.w, self.cs, self.sn, self.kc, self.vc, self.x8,
+                            self.xb8, self.q8b, self.kb8, self.vb8, self.att8,
+                            self.gug8, self.guu8, self.pos, self.base, self.li)
+        last = self.MR - 1
+        self.x[:] = self.x8[last * m.H:(last + 1) * m.H]
+        self.f_head(self.w, self.x, self.xb, self.out, self.logits)
+        return int(self.out[0])
 
     def step(self, tok: int, pos: int) -> int:
         self.pos[0] = pos
@@ -418,8 +579,13 @@ class Engine:
         out = []
         t0 = time.time()
         tok = prompt_ids[0]
-        for i, t in enumerate(prompt_ids):
-            tok = self.step(t, i)
+        pos = 0
+        if self.f_layer_m8 is not None:
+            while pos + self.MR <= len(prompt_ids):
+                tok = self._prefill_chunk(prompt_ids[pos:pos + self.MR], pos)
+                pos += self.MR
+        for i in range(pos, len(prompt_ids)):
+            tok = self.step(prompt_ids[i], i)
         self.posn = len(prompt_ids)
         self.last_prefill_s = time.time() - t0
         t1 = time.time()

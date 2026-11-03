@@ -117,6 +117,57 @@ static inline void gemv_q8_impl(int N, int K, const uint8_t *q,
   }
 }
 
+/* M-row Q8 GEMV for prefill: one weight read serves MR activation rows.
+ * Decode keeps using gemv_q8_impl (M=1); this one exists because prefill was
+ * re-reading every weight once per prompt token. */
+static inline void gemv_q8_m8_impl(int N, int K, const uint8_t *q,
+                                   const uint16_t *s, const float *x,
+                                   float *y) {
+  const int kb = K >> 5;
+  const int8_t *w = (const int8_t *)q;
+
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static)
+#endif
+  for (int n = 0; n < N; ++n) {
+    const int8_t *wr = w + (size_t)n * K;
+    const uint16_t *sr = s + (size_t)n * kb;
+    size_t vl32 = __riscv_vsetvl_e32m4((size_t)32);
+    vfloat32m4_t a0 = __riscv_vfmv_v_f_f32m4(0.0f, vl32);
+    vfloat32m4_t a1 = __riscv_vfmv_v_f_f32m4(0.0f, vl32);
+    vfloat32m4_t a2 = __riscv_vfmv_v_f_f32m4(0.0f, vl32);
+    vfloat32m4_t a3 = __riscv_vfmv_v_f_f32m4(0.0f, vl32);
+    vfloat32m4_t a4 = __riscv_vfmv_v_f_f32m4(0.0f, vl32);
+    vfloat32m4_t a5 = __riscv_vfmv_v_f_f32m4(0.0f, vl32);
+    vfloat32m4_t a6 = __riscv_vfmv_v_f_f32m4(0.0f, vl32);
+    vfloat32m4_t a7 = __riscv_vfmv_v_f_f32m4(0.0f, vl32);
+    for (int b = 0; b < kb; ++b) {
+      const int off = b << 5;
+      size_t vl = __riscv_vsetvl_e8m1((size_t)32);
+      vint8m1_t wv = __riscv_vle8_v_i8m1(wr + off, vl);
+      vfloat32m4_t wf =
+          __riscv_vfcvt_f_x_v_f32m4(__riscv_vsext_vf4_i32m4(wv, vl), vl);
+      wf = __riscv_vfmul_vf_f32m4(wf, half_to_float(sr[b]), vl);
+      a0 = __riscv_vfmacc_vv_f32m4(a0, wf, __riscv_vle32_v_f32m4(x + off, vl), vl);
+      a1 = __riscv_vfmacc_vv_f32m4(a1, wf, __riscv_vle32_v_f32m4(x + K + off, vl), vl);
+      a2 = __riscv_vfmacc_vv_f32m4(a2, wf, __riscv_vle32_v_f32m4(x + 2 * K + off, vl), vl);
+      a3 = __riscv_vfmacc_vv_f32m4(a3, wf, __riscv_vle32_v_f32m4(x + 3 * K + off, vl), vl);
+      a4 = __riscv_vfmacc_vv_f32m4(a4, wf, __riscv_vle32_v_f32m4(x + 4 * K + off, vl), vl);
+      a5 = __riscv_vfmacc_vv_f32m4(a5, wf, __riscv_vle32_v_f32m4(x + 5 * K + off, vl), vl);
+      a6 = __riscv_vfmacc_vv_f32m4(a6, wf, __riscv_vle32_v_f32m4(x + 6 * K + off, vl), vl);
+      a7 = __riscv_vfmacc_vv_f32m4(a7, wf, __riscv_vle32_v_f32m4(x + 7 * K + off, vl), vl);
+    }
+    y[(size_t)0 * N + n] = hsum_f32m4(a0, vl32);
+    y[(size_t)1 * N + n] = hsum_f32m4(a1, vl32);
+    y[(size_t)2 * N + n] = hsum_f32m4(a2, vl32);
+    y[(size_t)3 * N + n] = hsum_f32m4(a3, vl32);
+    y[(size_t)4 * N + n] = hsum_f32m4(a4, vl32);
+    y[(size_t)5 * N + n] = hsum_f32m4(a5, vl32);
+    y[(size_t)6 * N + n] = hsum_f32m4(a6, vl32);
+    y[(size_t)7 * N + n] = hsum_f32m4(a7, vl32);
+  }
+}
+
 /* Q4 GEMV: same shape as gemv_q8, but 32 weights occupy 16 bytes plus one
  * fp16 scale (llama.cpp Q4_0 grid: byte j holds value j in the low nibble and
  * value j+16 in the high nibble, dequant (nibble-8)*scale).
@@ -367,6 +418,12 @@ static inline int32_t tl_riscv_gemv_q8(int32_t N, int32_t K, uint8_t *q,
 static inline int32_t tl_riscv_gemv_q4(int32_t N, int32_t K, uint8_t *q,
                                        uint8_t *sc, float *x, float *y) {
   tl::rv::gemv_q4_impl(N, K, q, sc, x, y);
+  return 0;
+}
+
+static inline int32_t tl_riscv_gemv_q8_m8(int32_t N, int32_t K, uint8_t *q,
+                                          uint8_t *sc, float *x, float *y) {
+  tl::rv::gemv_q8_m8_impl(N, K, q, (const uint16_t *)sc, x, y);
   return 0;
 }
 
