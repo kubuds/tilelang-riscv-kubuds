@@ -12,6 +12,7 @@
 #include <tvm/tirx/stmt_functor.h>
 #include <tvm/tirx/transform.h>
 
+#include "backend/common/target_utils.h"
 #include "common/storage_size.h"
 #include "runtime/thread_storage_scope.h"
 #include "tir/transforms/ir_utils.h"
@@ -170,10 +171,21 @@ private:
     if (storage_scope.rank == runtime::StorageRank::kShared &&
         storage_scope.tag == ".dyn") {
       if (dyn_shmem_size.defined()) {
-        LOG(FATAL) << "Only one dynamic shared memory allocation is allowed; "
-                   << "second buffer: " << op->buffer->name << " scope="
-                   << op->buffer.scope() << " bytes="
-                   << GetBufferStorageSizeBytes(op->buffer);
+        // On a GPU the launch carries exactly one dynamic shared-memory size,
+        // so a second allocation means the merge pass failed.  A CPU-class
+        // target has no such field to fill: the C backend emits one static
+        // array per buffer, and dyn_shmem_size is only bookkeeping.  Summing
+        // is therefore conservative and correct here, while the GPU path
+        // keeps its hard error.
+        if (TargetIsCPU(info_.target)) {
+          dyn_shmem_size =
+              dyn_shmem_size.value() + GetBufferStorageSizeBytes(op->buffer);
+        } else {
+          LOG(FATAL) << "Only one dynamic shared memory allocation is allowed; "
+                     << "second buffer: " << op->buffer->name << " scope="
+                     << op->buffer.scope() << " bytes="
+                     << GetBufferStorageSizeBytes(op->buffer);
+        }
       }
       ICHECK_GT(op->buffer->shape.size(), 0);
 
