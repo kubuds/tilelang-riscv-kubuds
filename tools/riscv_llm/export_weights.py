@@ -58,6 +58,26 @@ class Blob:
         self.f.close()
 
 
+def quantize_q4(w: torch.Tensor) -> tuple[np.ndarray, np.ndarray]:
+    """[N,K] fp -> packed 4-bit [N, K/2] + fp16 scales [N, K/32].
+
+    Q4_0 grid: 32 values per block, one fp16 scale, byte j carries value j in
+    the low nibble and value j+16 in the high nibble, value = (nibble-8)*scale.
+    The kernel relies on exactly this layout, so it is spelled out here rather
+    than borrowed.
+    """
+    w = w.detach().float().contiguous()
+    n, k = w.shape
+    assert k % 32 == 0, k
+    blocks = w.reshape(n, k // 32, 32)
+    amax = blocks.abs().amax(dim=2).clamp_min(1e-8)
+    scale = amax / 7.0
+    q = torch.round(blocks / scale[:, :, None]).clamp(-8, 7).to(torch.int8) + 8
+    q = q.reshape(n, k // 32, 2, 16).to(torch.uint8)
+    packed = (q[:, :, 0, :] | (q[:, :, 1, :] << 4)).reshape(n, k // 2)
+    return packed.numpy(), scale.to(torch.float16).contiguous().numpy()
+
+
 def quantize(w: torch.Tensor) -> tuple[np.ndarray, np.ndarray]:
     """[N,K] fp -> int8 q [N,K] + fp16 scales [N,K/32]."""
     w = w.detach().float().contiguous()
@@ -72,7 +92,7 @@ def quantize(w: torch.Tensor) -> tuple[np.ndarray, np.ndarray]:
 
 
 def add_weight(blob: Blob, name: str, w: torch.Tensor):
-    q, s = quantize(w)
+    q, s = quantize_q4(w) if QBITS == 4 else quantize(w)
     blob.write(name + ".q", q)
     blob.write(name + ".s", s)
 
@@ -82,8 +102,12 @@ def main() -> int:
     ap.add_argument("hf_dir")
     ap.add_argument("out")
     ap.add_argument("--int8", action="store_true", default=True)
+    ap.add_argument("--q4", action="store_true",
+                    help="4-bit weights (16 bytes + fp16 scale per 32)")
     args = ap.parse_args()
 
+    global QBITS
+    QBITS = 4 if args.q4 else 8
     cfg = json.load(open(os.path.join(args.hf_dir, "config.json")))
     H = cfg["hidden_size"]
     L = cfg["num_hidden_layers"]
@@ -105,11 +129,21 @@ def main() -> int:
     KV_PAD = NKV_PAD * HD
 
     tensors = {}
-    with safe_open(os.path.join(args.hf_dir, "model.safetensors"), framework="pt") as f:
-        names = list(f.keys())
-        for n in names:
-            # keep bf16 on disk -> fp32 per tensor on demand
-            tensors[n] = f.get_tensor(n)
+    # Sharded checkpoints (Qwen3-1.7B and up) only ship an index + shards;
+    # single-file ones ship model.safetensors.  Support both.
+    single = os.path.join(args.hf_dir, "model.safetensors")
+    index = os.path.join(args.hf_dir, "model.safetensors.index.json")
+    if os.path.exists(single):
+        shards = [single]
+        weight_map = None
+    else:
+        weight_map = json.load(open(index))["weight_map"]
+        shards = sorted({os.path.join(args.hf_dir, f) for f in set(weight_map.values())})
+    for shard in shards:
+        with safe_open(shard, framework="pt") as f:
+            for n in f.keys():
+                tensors[n] = f.get_tensor(n)
+    names = list(tensors.keys())
 
     has_bias = any(k.endswith("q_proj.bias") for k in names)
     has_qk_norm = any(k.endswith("q_norm.weight") for k in names)
@@ -134,7 +168,8 @@ def main() -> int:
     for nm, rows, cols in (("wq", NQ, H), ("wk", KV_PAD, H), ("wv", KV_PAD, H),
                            ("wo", H, NQ), ("wgate", IM, H), ("wup", IM, H),
                            ("wdown", H, IM)):
-        probe.write(nm + ".q", np.zeros((rows, cols), np.int8))
+        width = cols // 2 if QBITS == 4 else cols
+        probe.write(nm + ".q", np.zeros((rows, width), np.uint8 if QBITS == 4 else np.int8))
         probe.write(nm + ".s", np.zeros((rows, cols // 32), np.float16))
     layer_stride = align(probe.pos)
     probe.close()
@@ -180,7 +215,7 @@ def main() -> int:
         if l == 0:
             layer_off = {k: v - t0 for k, v in blob.off.items()
                          if t0 <= v < t0 + layer_stride}
-    lm_q, lm_s = quantize(lm)
+    lm_q, lm_s = quantize_q4(lm) if QBITS == 4 else quantize(lm)
     blob.write("lm_head.q", lm_q)
     blob.write("lm_head.s", lm_s)
     total = blob.pos
@@ -188,14 +223,14 @@ def main() -> int:
 
     meta = dict(H=H, L=L, NH=NH, NKV=NKV_PAD, nkv_attn=NKV, HD=HD, IM=IM, V=V, eps=eps,
                 theta=theta, has_bias=has_bias, has_qk_norm=has_qk_norm,
-                tied=tied, nbytes=total, layer_stride=layer_stride,
+                tied=tied, nbytes=total, layer_stride=layer_stride, wbits=QBITS,
                 layer_off=layer_off, layer_base=layer_base,
                 embed=0, embed_nbytes=int(tensors["model.embed_tokens.weight"].numel() * 2),
                 final_norm=blob.off["final_norm"],
                 lm_q=blob.off["lm_head.q"], lm_s=blob.off["lm_head.s"])
     with open(args.out + ".json", "w") as f:
         json.dump(meta, f, indent=1)
-    print(f"wrote {args.out}: {total/1e9:.3f} GB, layer_stride {layer_stride}"
+    print(f"wrote {args.out}: {total/1e9:.3f} GB, {QBITS}-bit, layer_stride {layer_stride}"
           f" ({layer_stride/1e6:.2f} MB), qk_norm={has_qk_norm} bias={has_bias}"
           f" tied={tied}")
     return 0

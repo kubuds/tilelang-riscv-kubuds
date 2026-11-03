@@ -1,0 +1,144 @@
+# TileLang RISC-V 后端：多模型性能基线报告
+
+日期：2026-11-03
+仓库：/work/kubuds/hermes/tilelang_riscv（tile-ai/tilelang v0.1.15 + riscv 后端）
+硬件：进迭时空 K3，8×X100（VLEN=256，cpu0-7），32 GB，Bianbu，gcc 15.2
+引擎：tilelang/riscv/llm（int8 Q8_0 网格权重，RVV GEMV，单层一个 TIR 程序）
+运行参数：OMP_NUM_THREADS=7，greedy，maxseq=128，raw prompt "The capital of France is"
+
+## 1. 结论
+
+三个稠密模型全部跑通，输出可读；一个 MoE 模型不支持。
+
+  模型                     权重      prefill        decode        同机 llama.cpp    比例
+  Qwen3-0.6B (int8)        0.94 GB   45 ms/tok      22.2-24.4 tok  30.20 (Q8_0)     73-81%
+  Qwen3-1.7B (int8)        2.45 GB   120 ms/tok     8.54 tok/s     15.73 (Q4_K_M)   54%
+  DeepSeek-R1-Distill-1.5B 2.13 GB   121-224 ms/tok 8.5 tok/s      16.22 (Q4_K_M)   52%
+  Qwen3-30B-A3B            --        不支持（MoE）  --             7.59             --
+
+  参考（同一台机器、同一时段，llama.cpp SpacemiT 官方构建，IME2 开启，t=4）：
+    Qwen3-0.6B Q8_0    pp64 199.7  tg64 30.20
+    Qwen3-0.6B Q4_K_M  pp64 212.7  tg64 37.49
+    Qwen3-1.7B Q4_K_M  pp64  89.6  tg64 15.73
+    DS-1.5B   Q4_K_M   pp64 101.7  tg64 16.22
+
+decode 数字有 ±10% 波动（同一二进制在 22.2-24.4 之间跳），这是机器负载导致的，
+比例才是有效信息；所有对比都是同段连续运行。
+
+## 2. 支持范围
+
+引擎实现的是 Qwen2 / Qwen3 的稠密 decoder（RMSNorm、qk-norm、NeoX RoPE、
+GQA、SwiGLU、qkv bias），以及 tie / 非 tie 的 lm_head：
+
+  已跑通：Qwen3-0.6B、Qwen3-1.7B（Qwen3，qk_norm，tie）、
+          DeepSeek-R1-Distill-Qwen-1.5B（Qwen2，qkv bias，KV 头 2 个）
+  不支持：Qwen3-30B-A3B（MoE：路由 + top-k 专家 + 共享专家，引擎没有实现；
+          且 safetensors 约 60 GB，本机下载/内存不划算）
+          视觉/多模态模型（需要 vision tower，不在 decoder 路径里）
+
+参数适配只依赖 config.json 的字段（hidden_size / num_attention_heads /
+num_key_value_heads / head_dim / intermediate_size / rope_theta / tie_word_embeddings），
+所以同一份代码换个权重文件即可，不需要改内核。
+
+## 3. 各模型实测
+
+### 3.1 Qwen3-0.6B（Qwen3ForCausalLM）
+
+  H=1024  L=28  heads 16/8  HD=128  IM=3072  V=151936  qk_norm  tie
+  权重 0.94 GB（层 0.42 + lm_head 0.155 + embed fp16 0.31，embed 只读一行不计入流量）
+  每 token 流 654 MB，实测 16 GB/s 有效带宽（DRAM 峰值约 21 GB/s）
+
+  prefill 45 ms/token（约 22 tok/s，逐 token GEMV，没有批量 GEMM）
+  decode   22.2-24.4 tok/s
+  输出： " Paris. The capital of Italy is Rome. The capital of Spain is Madrid. ..."
+
+### 3.2 Qwen3-1.7B
+
+  H=2048  L=28  heads 16/8  HD=128  IM=6144  V=151936  qk_norm  tie
+  权重 2.45 GB（层 1.50 + lm_head 0.39 + embed fp16 0.62）
+  每 token 流约 1.9 GB
+
+  prefill 120 ms/token（8.3 tok/s）
+  decode   8.54 tok/s
+  输出： " Paris. The capital of the United States is Washington, D.C. ..."
+
+### 3.3 DeepSeek-R1-Distill-Qwen-1.5B（Qwen2ForCausalLM）
+
+  H=1536  L=28  heads 12/2  HD=128  IM=8960  V=151936  qkv bias  非 tie
+  权重 2.13 GB（K/V 头 2 个补零到 4 个以绕开 lowering bug，bias 同步补齐）
+  每 token 流约 2.13 GB
+
+  prefill 121-224 ms/token（波动大，机器负载敏感）
+  decode   8.4-8.5 tok/s
+  输出： " Paris, and the capital of Germany is Berlin. So, the capital of France is not ..."
+
+## 4. 4bit 权重实验：在 X100 上是负结果
+
+动机：0.6B 每 token 654 MB 已经贴住带宽墙，把权重降到 4bit 应该直接省一半字节。
+做了 Q4_0 网格（32 个值一块、16 字节 + fp16 scale，nibble-8 反量化）的 RVV GEMV，
+数值正确（对拍误差 1.7e-04），但实测：
+
+  0.6B int8   权重 0.945 GB   decode 22.2-24.4 tok/s
+  0.6B q4     权重 0.647 GB   decode 16.52 tok/s      （更慢）
+
+原因可量化。同一形状（2048×1024）的 GEMV microbench：
+
+  int8:  0.11 ms   20.4 GB/s
+  q4:    0.15 ms    7.8 GB/s
+
+q4 每 32 个权重需要 13 条向量指令（解包、与、右移、两次零扩、两次整转浮点、
+两次减 8、两次乘 scale、两次 FMA），int8 只要 5 条。X100 的向量单元因此从
+"带宽受限" 变成 "指令受限"：字节少了一半，时间却多了 36%，端到端反而慢 1.4 倍。
+第一版用 m4 寄存器装 16 个 lane（浪费一半宽度）时更差，只有 8.8 tok/s；
+换成 m2 后到 16.5，仍不及 int8。
+
+结论：4bit 在 X100 的 RVV 上不划算，除非把解包压到 ~6 条指令/32 权重以下
+（例如改用 vmadotsu 这类原生 4bit 点积，但那要 A100/IME2，且激活也要降到 4bit，
+精度损失另算）。这条路线在本报告里关闭。
+
+## 5. 与 llama.cpp 的差距怎么看
+
+  1) 位宽差：llama.cpp 在 1.5B/1.7B 上跑 Q4_K_M（1.0-1.1 GB/token），
+     本引擎是 int8（2.1-1.9 GB/token）。两者都已经贴住 DRAM：
+     本引擎 17.9 GB/s、llama.cpp 16-18 GB/s。字节多一倍，tok/s 就少一半，
+     这不是内核效率问题。0.6B 同为 Q8_0 时差距只有 19%，才是真正的实现差距。
+  2) 0.6B 那 19%：llama.cpp 的 spacemit 后端把 GEMM 交给 A100 的 IME2，
+     并用大页；本引擎全部在 X100 上用 RVV 流式 GEMV。
+  3) prefill 差距更大（22 vs 200 tok/s）：本引擎 prefill 也是逐 token 的 GEMV，
+     没有做批量 GEMM。要做快必须把整段 prompt 当矩阵乘喂给 IME2。
+  4) 本引擎的已知固定开销：每 token 28 次逐层调用（整模型 lowering 在 1.5B/1.7B
+     形状上会触发 TVM 的 scalable-vector bug），约 3-5 ms/token。
+
+下一步按收益排序：
+  a. prefill 批量化 + IME2（跨簇生产者/消费者），这是最大的一块（约 9 倍差距）
+  b. 1.5B/1.7B 用 4bit 但走 IME2 的 vmadotsu 原生 4bit 点积（而不是 RVV 解包）
+  c. 修 TVM 的 scalable-vector lowering bug，去掉逐层调用的开销
+
+## 6. 内存与稳定性
+
+  权重按 mmap 只读映射，页缓存共享；三个模型同时驻留也不爆内存（31 GB）。
+  KV cache: 0.6B 58 MB、1.5B 30 MB、1.7B 58 MB（maxseq=128，fp32）。
+  连续跑三个模型无崩溃；8 线程会因 OpenMP 自旋争用掉到 5 tok/s，必须用 7。
+
+## 7. 复现
+
+  cd /work/kubuds/hermes/tilelang_riscv
+  export PYTHONPATH=$PWD
+  P=/work/kubuds/hermes/flagos_ws/.venv/bin/python
+
+  # 导出（safetensors，单文件或分片均可）
+  $P tools/riscv_llm/export_weights.py /path/to/hf_dir /tmp/model.bin
+
+  # 运行
+  OMP_NUM_THREADS=7 $P tools/riscv_llm/run_model.py /tmp/model.bin \
+    /path/to/tokenizer.json --prompt "The capital of France is" --n 64 --maxseq 128 --raw
+
+  # 参考基线
+  llama-bench -m <model>.gguf -p 64 -n 64 -t 4
+
+## 8. 本轮代码变更
+
+  feat(riscv-llm): Q4 weight path -- RVV 4-bit GEMV kernel, --q4 export, engine switch
+  feat(riscv-llm): sharded safetensors support (Qwen3-1.7B) + model baselines
+
+4bit 路径保留为可选（--q4），默认仍是 int8；报告记录了它更慢的实测原因。

@@ -60,6 +60,7 @@ class Meta:
     lm_s: int
     final_norm: int
     nkv_attn: int = 0
+    wbits: int = 8
 
     @property
     def NQ(self):
@@ -87,6 +88,7 @@ def build_step(m: Meta, maxseq: int):
     eps, LS = m.eps, m.layer_stride
     o = m.layer_off
     scale = 1.0 / (HD ** 0.5)
+    GEMV = "tl_riscv_gemv_q4" if m.wbits == 4 else "tl_riscv_gemv_q8"
 
     @T.prim_func
     def step(
@@ -115,13 +117,13 @@ def build_step(m: Meta, maxseq: int):
                 p = POS[0]
                 _call("tl_riscv_rmsnorm", H, T.address_of(X[0]),
                       T.address_of(W[T.cast(b + o["rms_attn"], 'int64')]), eps, T.address_of(XB[0]))
-                _call("tl_riscv_gemv_q8", NQ, H, T.address_of(W[T.cast(b + o["wq.q"], 'int64')]),
+                _call(GEMV, NQ, H, T.address_of(W[T.cast(b + o["wq.q"], 'int64')]),
                       T.address_of(W[T.cast(b + o["wq.s"], 'int64')]), T.address_of(XB[0]),
                       T.address_of(Q[0]))
-                _call("tl_riscv_gemv_q8", KVD, H, T.address_of(W[T.cast(b + o["wk.q"], 'int64')]),
+                _call(GEMV, KVD, H, T.address_of(W[T.cast(b + o["wk.q"], 'int64')]),
                       T.address_of(W[T.cast(b + o["wk.s"], 'int64')]), T.address_of(XB[0]),
                       T.address_of(KB[0]))
-                _call("tl_riscv_gemv_q8", KVD, H, T.address_of(W[T.cast(b + o["wv.q"], 'int64')]),
+                _call(GEMV, KVD, H, T.address_of(W[T.cast(b + o["wv.q"], 'int64')]),
                       T.address_of(W[T.cast(b + o["wv.s"], 'int64')]), T.address_of(XB[0]),
                       T.address_of(VB[0]))
                 if m.has_bias:
@@ -157,7 +159,7 @@ def build_step(m: Meta, maxseq: int):
                       T.address_of(KC[l * NKV * maxseq * HD]),
                       T.address_of(VC[l * NKV * maxseq * HD]),
                       T.address_of(ATT[0]))
-                _call("tl_riscv_gemv_q8", H, NQ, T.address_of(W[T.cast(b + o["wo.q"], 'int64')]),
+                _call(GEMV, H, NQ, T.address_of(W[T.cast(b + o["wo.q"], 'int64')]),
                       T.address_of(W[T.cast(b + o["wo.s"], 'int64')]), T.address_of(ATT[0]),
                       T.address_of(XB[0]))
                 _call("tl_riscv_add", H, T.address_of(X[0]),
@@ -165,15 +167,15 @@ def build_step(m: Meta, maxseq: int):
 
                 _call("tl_riscv_rmsnorm", H, T.address_of(X[0]),
                       T.address_of(W[T.cast(b + o["rms_ffn"], 'int64')]), eps, T.address_of(XB[0]))
-                _call("tl_riscv_gemv_q8", IM, H, T.address_of(W[T.cast(b + o["wgate.q"], 'int64')]),
+                _call(GEMV, IM, H, T.address_of(W[T.cast(b + o["wgate.q"], 'int64')]),
                       T.address_of(W[T.cast(b + o["wgate.s"], 'int64')]), T.address_of(XB[0]),
                       T.address_of(GU[0]))
-                _call("tl_riscv_gemv_q8", IM, H, T.address_of(W[T.cast(b + o["wup.q"], 'int64')]),
+                _call(GEMV, IM, H, T.address_of(W[T.cast(b + o["wup.q"], 'int64')]),
                       T.address_of(W[T.cast(b + o["wup.s"], 'int64')]), T.address_of(XB[0]),
                       T.address_of(GU[IM]))
                 _call("tl_riscv_silu_mul", IM, T.address_of(GU[0]),
                       T.address_of(GU[IM]), T.address_of(GU[0]))
-                _call("tl_riscv_gemv_q8", H, IM, T.address_of(W[T.cast(b + o["wdown.q"], 'int64')]),
+                _call(GEMV, H, IM, T.address_of(W[T.cast(b + o["wdown.q"], 'int64')]),
                       T.address_of(W[T.cast(b + o["wdown.s"], 'int64')]), T.address_of(GU[0]),
                       T.address_of(XB[0]))
                 _call("tl_riscv_add", H, T.address_of(X[0]),
@@ -181,7 +183,7 @@ def build_step(m: Meta, maxseq: int):
 
             _call("tl_riscv_rmsnorm", H, T.address_of(X[0]),
                   T.address_of(W[T.cast(m.final_norm, 'int64')]), eps, T.address_of(XB[0]))
-            _call("tl_riscv_gemv_q8", V, H, T.address_of(W[T.cast(m.lm_q, 'int64')]),
+            _call(GEMV, V, H, T.address_of(W[T.cast(m.lm_q, 'int64')]),
                   T.address_of(W[T.cast(m.lm_s, 'int64')]), T.address_of(XB[0]),
                   T.address_of(LOGITS[0]))
             _call("tl_riscv_argmax", V, T.address_of(LOGITS[0]),
@@ -196,6 +198,7 @@ def build_layer(m: Meta, maxseq: int):
     eps = m.eps
     o = m.layer_off
     scale = 1.0 / (HD ** 0.5)
+    GEMV = "tl_riscv_gemv_q4" if m.wbits == 4 else "tl_riscv_gemv_q8"
 
     @T.prim_func
     def layer(
@@ -224,15 +227,15 @@ def build_layer(m: Meta, maxseq: int):
             _call("tl_riscv_rmsnorm", H, T.address_of(X[0]),
                   T.address_of(W[T.cast(b + o["rms_attn"], "int64")]), eps,
                   T.address_of(XB[0]))
-            _call("tl_riscv_gemv_q8", NQ, H,
+            _call(GEMV, NQ, H,
                   T.address_of(W[T.cast(b + o["wq.q"], "int64")]),
                   T.address_of(W[T.cast(b + o["wq.s"], "int64")]),
                   T.address_of(XB[0]), T.address_of(Q[0]))
-            _call("tl_riscv_gemv_q8", KVD, H,
+            _call(GEMV, KVD, H,
                   T.address_of(W[T.cast(b + o["wk.q"], "int64")]),
                   T.address_of(W[T.cast(b + o["wk.s"], "int64")]),
                   T.address_of(XB[0]), T.address_of(KB[0]))
-            _call("tl_riscv_gemv_q8", KVD, H,
+            _call(GEMV, KVD, H,
                   T.address_of(W[T.cast(b + o["wv.q"], "int64")]),
                   T.address_of(W[T.cast(b + o["wv.s"], "int64")]),
                   T.address_of(XB[0]), T.address_of(VB[0]))
@@ -267,7 +270,7 @@ def build_layer(m: Meta, maxseq: int):
                   T.address_of(KC[l * NKV * maxseq * HD]),
                   T.address_of(VC[l * NKV * maxseq * HD]),
                   T.address_of(ATT[0]))
-            _call("tl_riscv_gemv_q8", H, NQ,
+            _call(GEMV, H, NQ,
                   T.address_of(W[T.cast(b + o["wo.q"], "int64")]),
                   T.address_of(W[T.cast(b + o["wo.s"], "int64")]),
                   T.address_of(ATT[0]), T.address_of(XB[0]))
@@ -276,17 +279,17 @@ def build_layer(m: Meta, maxseq: int):
             _call("tl_riscv_rmsnorm", H, T.address_of(X[0]),
                   T.address_of(W[T.cast(b + o["rms_ffn"], "int64")]), eps,
                   T.address_of(XB[0]))
-            _call("tl_riscv_gemv_q8", IM, H,
+            _call(GEMV, IM, H,
                   T.address_of(W[T.cast(b + o["wgate.q"], "int64")]),
                   T.address_of(W[T.cast(b + o["wgate.s"], "int64")]),
                   T.address_of(XB[0]), T.address_of(GU[0]))
-            _call("tl_riscv_gemv_q8", IM, H,
+            _call(GEMV, IM, H,
                   T.address_of(W[T.cast(b + o["wup.q"], "int64")]),
                   T.address_of(W[T.cast(b + o["wup.s"], "int64")]),
                   T.address_of(XB[0]), T.address_of(GU[IM]))
             _call("tl_riscv_silu_mul", IM, T.address_of(GU[0]),
                   T.address_of(GU[IM]), T.address_of(GU[0]))
-            _call("tl_riscv_gemv_q8", H, IM,
+            _call(GEMV, H, IM,
                   T.address_of(W[T.cast(b + o["wdown.q"], "int64")]),
                   T.address_of(W[T.cast(b + o["wdown.s"], "int64")]),
                   T.address_of(GU[0]), T.address_of(XB[0]))
@@ -297,6 +300,7 @@ def build_layer(m: Meta, maxseq: int):
 
 def build_head(m: Meta):
     H, V = m.H, m.V
+    GEMV = "tl_riscv_gemv_q4" if m.wbits == 4 else "tl_riscv_gemv_q8"
 
     @T.prim_func
     def head(
@@ -310,7 +314,7 @@ def build_head(m: Meta):
             _call("tl_riscv_rmsnorm", H, T.address_of(X[0]),
                   T.address_of(W[T.cast(m.final_norm, "int64")]), m.eps,
                   T.address_of(XB[0]))
-            _call("tl_riscv_gemv_q8", V, H,
+            _call(GEMV, V, H,
                   T.address_of(W[T.cast(m.lm_q, "int64")]),
                   T.address_of(W[T.cast(m.lm_s, "int64")]),
                   T.address_of(XB[0]), T.address_of(LOGITS[0]))

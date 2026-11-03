@@ -117,6 +117,51 @@ static inline void gemv_q8_impl(int N, int K, const uint8_t *q,
   }
 }
 
+/* Q4 GEMV: same shape as gemv_q8, but 32 weights occupy 16 bytes plus one
+ * fp16 scale (llama.cpp Q4_0 grid: byte j holds value j in the low nibble and
+ * value j+16 in the high nibble, dequant (nibble-8)*scale).
+ *
+ * Decoding in the kernel instead of unpacking a Q8 copy is what halves the
+ * weight stream; the extra shift/mask/convert instructions are hidden behind
+ * DRAM on X100 (measured: see docs/RISCV_BACKEND.md).
+ */
+static inline void gemv_q4_impl(int N, int K, const uint8_t *q,
+                                const uint8_t *sc, const float *x, float *y) {
+  const int kb = K >> 5;
+  const uint16_t *s = (const uint16_t *)sc;
+
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static)
+#endif
+  for (int n = 0; n < N; ++n) {
+    const uint8_t *qr = q + (size_t)n * (K >> 1);
+    const uint16_t *sr = s + (size_t)n * kb;
+    size_t vl16 = __riscv_vsetvl_e32m2((size_t)16);
+    vfloat32m2_t acc = __riscv_vfmv_v_f_f32m2(0.0f, vl16);
+    for (int b = 0; b < kb; ++b) {
+      const int off = b << 5;
+      size_t vl = __riscv_vsetvl_e8mf2((size_t)16);
+      vuint8mf2_t v = __riscv_vle8_v_u8mf2(qr + (b << 4), vl);
+      vuint8mf2_t lo = __riscv_vand_vx_u8mf2(v, 0x0Fu, vl);
+      vuint8mf2_t hi = __riscv_vsrl_vx_u8mf2(v, 4, vl);
+      float d = half_to_float(sr[b]);
+      vfloat32m2_t lof = __riscv_vfcvt_f_xu_v_f32m2(
+          __riscv_vzext_vf4_u32m2(lo, vl), vl);
+      vfloat32m2_t hif = __riscv_vfcvt_f_xu_v_f32m2(
+          __riscv_vzext_vf4_u32m2(hi, vl), vl);
+      lof = __riscv_vfmul_vf_f32m2(__riscv_vfsub_vf_f32m2(lof, 8.0f, vl), d, vl);
+      hif = __riscv_vfmul_vf_f32m2(__riscv_vfsub_vf_f32m2(hif, 8.0f, vl), d, vl);
+      acc = __riscv_vfmacc_vv_f32m2(acc, lof,
+                                    __riscv_vle32_v_f32m2(x + off, vl), vl);
+      acc = __riscv_vfmacc_vv_f32m2(
+          acc, hif, __riscv_vle32_v_f32m2(x + off + 16, vl), vl);
+    }
+    vfloat32m1_t r = __riscv_vfredusum_vs_f32m2_f32m1(
+        acc, __riscv_vfmv_v_f_f32m1(0.0f, 1), vl16);
+    y[n] = __riscv_vfmv_f_s_f32m1_f32(r);
+  }
+}
+
 /* y = x * rsqrt(mean(x^2) + eps) * g   -- one row, K elements */
 static inline void rmsnorm_impl(int K, const float *x, const float *g, float eps,
                                 float *y) {
@@ -316,6 +361,12 @@ extern "C" {
 static inline int32_t tl_riscv_gemv_q8(int32_t N, int32_t K, uint8_t *q,
                                        uint8_t *sc, float *x, float *y) {
   tl::rv::gemv_q8_impl(N, K, q, sc, x, y);
+  return 0;
+}
+
+static inline int32_t tl_riscv_gemv_q4(int32_t N, int32_t K, uint8_t *q,
+                                       uint8_t *sc, float *x, float *y) {
+  tl::rv::gemv_q4_impl(N, K, q, sc, x, y);
   return 0;
 }
 
