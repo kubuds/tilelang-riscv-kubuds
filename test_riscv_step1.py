@@ -21,6 +21,7 @@ would mean the backend is wrong, not that the kernel is different.
 from __future__ import annotations
 
 import glob
+import json
 import os
 import subprocess
 import sys
@@ -38,13 +39,13 @@ BM, BN, BK = 128, 128, 128
 def make_kernel():
     @T.prim_func
     def matmul(
-        A: T.Tensor((M, K), "float16"),
-        B: T.Tensor((K, N), "float16"),
+        A: T.Tensor((M, K), "float32"),
+        B: T.Tensor((K, N), "float32"),
         C: T.Tensor((M, N), "float32"),
     ):
         with T.Kernel(T.ceildiv(N, BN), T.ceildiv(M, BM)) as (bx, by):
-            A_l = T.alloc_local((BM, BK), "float16")
-            B_l = T.alloc_local((BK, BN), "float16")
+            A_l = T.alloc_local((BM, BK), "float32")
+            B_l = T.alloc_local((BK, BN), "float32")
             C_l = T.alloc_local((BM, BN), "float32")
 
             for i in T.serial(BM):
@@ -75,20 +76,28 @@ def newest_so(before: set[str]) -> str | None:
 
 
 def main() -> int:
-    target_str = sys.argv[1] if len(sys.argv) > 1 else "riscv -march=rv64gc -mabi=lp64d"
-    print(f"== target: {target_str}")
+    # TVM 0.25 removed CLI target strings; the JSON dict form is required.
+    # Accept either a JSON object or a bare kind name on the command line.
+    arg = sys.argv[1] if len(sys.argv) > 1 else ""
+    if arg.startswith("{"):
+        target_cfg = json.loads(arg)
+    elif arg:
+        target_cfg = {"kind": arg}
+    else:
+        target_cfg = {"kind": "riscv", "march": "rv64gc", "mabi": "lp64d"}
+    print(f"== target: {target_cfg}")
 
     cache = os.path.expanduser("~/.tilelang/cache")
     before = set(glob.glob(os.path.join(cache, "**", "*.so"), recursive=True))
 
     t0 = time.time()
-    with tvm.target.Target(target_str):
+    with tvm.target.Target(target_cfg):
         fn = tilelang.compile(make_kernel(), -1, execution_backend="tvm_ffi")
     t_build = time.time() - t0
     print(f"   compile: {t_build:.1f} s")
 
-    a = torch.randn(M, K, dtype=torch.float16)
-    b = torch.randn(K, N, dtype=torch.float16)
+    a = torch.randn(M, K, dtype=torch.float32)
+    b = torch.randn(K, N, dtype=torch.float32)
 
     t0 = time.time()
     c = fn(a, b)

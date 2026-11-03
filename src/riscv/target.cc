@@ -55,7 +55,6 @@ namespace refl = tvm::ffi::reflection;
 TVM_REGISTER_TARGET_KIND("riscv", kDLCPU)
     .add_attr_option<ffi::String>("march", refl::DefaultValue("rv64gc"))
     .add_attr_option<ffi::String>("mabi", refl::DefaultValue("lp64d"))
-    .add_attr_option<ffi::String>("mcpu", refl::DefaultValue("generic-rv64"))
     // 0 = unspecified.  Kernels must then be VLEN-agnostic (see step 2).
     .add_attr_option<int64_t>("vlen", refl::DefaultValue(0))
     // SpacemiT IME2 matrix unit.  Off by default: enabling it changes the
@@ -68,6 +67,6 @@ TVM_REGISTER_TARGET_KIND("riscv", kDLCPU)
     // Same meaning as for "c": kernels can return an int32 status code.
     .add_attr_option<bool>("supports_kernel_status_return",
                            refl::DefaultValue(true))
-    .set_default_keys({"riscv", "cpu"});
+    .set_default_keys({"riscv"});
 
 } // namespace tvm

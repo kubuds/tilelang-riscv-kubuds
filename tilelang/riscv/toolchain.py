@@ -26,6 +26,7 @@ produce for a generic riscv64 build.
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 from tvm.target import Target
 
@@ -47,7 +48,12 @@ def get_compile_flags(target: Target) -> list[str]:
 
     march = _attr_str(target, "march", "rv64gc")
     mabi = _attr_str(target, "mabi", "lp64d")
-    flags = [f"-march={march}", f"-mabi={mabi}"]
+    # tl_templates/ lives under <repo>/src; the generated C includes it by
+    # relative path, so the host compile must see it.  The CPU backend gets
+    # this from its own include list; the riscv kind is a new kind, so it has
+    # to spell it out.
+    src_inc = Path(__file__).resolve().parents[2] / "src"
+    flags = [f"-I{src_inc}", f"-march={march}", f"-mabi={mabi}"]
 
     # Only pin the vector width when the caller actually knows it.  An unknown
     # VLEN must stay unspecified so the compiler can emit VLEN-agnostic code.
