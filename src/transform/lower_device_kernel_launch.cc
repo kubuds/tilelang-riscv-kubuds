@@ -169,8 +169,12 @@ private:
     auto storage_scope = runtime::StorageScope::Create(scope);
     if (storage_scope.rank == runtime::StorageRank::kShared &&
         storage_scope.tag == ".dyn") {
-      ICHECK(!dyn_shmem_size.defined())
-          << "Only one dynamic shared memory allocation is allowed.";
+      if (dyn_shmem_size.defined()) {
+        LOG(FATAL) << "Only one dynamic shared memory allocation is allowed; "
+                   << "second buffer: " << op->buffer->name << " scope="
+                   << op->buffer.scope() << " bytes="
+                   << GetBufferStorageSizeBytes(op->buffer);
+      }
       ICHECK_GT(op->buffer->shape.size(), 0);
 
       dyn_shmem_size = GetBufferStorageSizeBytes(op->buffer);
