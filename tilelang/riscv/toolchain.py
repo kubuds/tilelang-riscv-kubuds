@@ -86,6 +86,8 @@ def get_compile_flags(target: Target) -> list[str]:
         # TVM compiles the generated C with g++, so the CBLAS enums in
         # cblas.h are typed and int literals from call_extern are rejected;
         # -fpermissive keeps the (correct) integer values usable.
-        flags.extend(["-include", "cblas.h", "-fpermissive", lib, "-lm"])
+        # TVM puts options before the object files, so --as-needed would
+        # discard the library before it sees the reference.
+        flags.extend(["-fpermissive", "-Wl,--no-as-needed", lib, "-lm"])
 
     return flags
