@@ -63,6 +63,10 @@ def get_compile_flags(target: Target) -> list[str]:
     # to spell it out.
     src_inc = Path(__file__).resolve().parents[2] / "src"
     flags = [f"-I{src_inc}", f"-march={march}", f"-mabi={mabi}"]
+    # The default -O2 leaves the TIR loop nest scalar (measured: zero vector
+    # instructions at rv64gcv).  -O3 enables the loop vectoriser; -ffast-math
+    # is deliberately NOT used because it would change numerics.
+    flags += ["-O3", "-ftree-vectorize"]
 
     # Only pin the vector width when the caller actually knows it.  An unknown
     # VLEN must stay unspecified so the compiler can emit VLEN-agnostic code.
