@@ -108,3 +108,25 @@ to that on this silicon is closed as measured:
 So on K3 the realistic outcome for a TileLang + RVV/IME2 decoder is parity
 with the vendor backend, not a win. Beating it needs a weight/activation
 format this ISA does not expose.
+## Where a decode step's time actually goes (Qwen3-0.6B, measured)
+
+tools/riscv_llm/profile_gemv.py builds the same layer program with only the
+seven GEMVs and times it:
+
+    layer GEMVs   1.28 ms/layer x 28 = 35.8 ms   (468 MB at 13.1 GB/s)
+    lm_head       151936x1024 int8             ~7 ms at ~22 GB/s
+    everything else (RMSNorm, RoPE, attention, SiLU, KV copy, argmax, FFI)
+                                               ~2-3 ms
+    full step                                  ~45 ms -> 22 tok/s
+
+So the non-GEMV code is only a few ms; the step is weight streaming, and the
+layer GEMV streams at 13.1 GB/s against a ~21 GB/s peak. The lm_head, a single
+long call with one large matrix, reaches 22 GB/s -- the difference is pipeline
+fill/drain across the 196 short GEMV calls per token, not arithmetic.
+
+Ceiling arithmetic with these numbers: reaching the vendor's 33 ms needs the
+layer GEMVs at 468 MB / (33 - 7 - 3) ms = 20.4 GB/s, i.e. about 97% of the
+measured DRAM peak. Even perfect overhead removal with today's 13.1 GB/s lands
+at 36 ms (28 tok/s). So the target is a bandwidth-utilisation problem, and the
+honest statement is: parity is reachable with a serious streaming rewrite,
+beating 30.2 tok/s requires running at essentially the memory roofline.
