@@ -80,6 +80,12 @@ def get_compile_flags(target: Target) -> list[str]:
     blas = _attr_str(target, "blas", "")
     if blas:
         lib = os.environ.get("TL_RISCV_OPENBLAS", _DEFAULT_OPENBLAS)
-        flags.extend([lib, "-lm"])
+        # The generated C only includes tl_templates/cpp/common.h, so cblas.h
+        # must be force-included; -include is order-independent and works for
+        # both .c and .cc compilation units.
+        # TVM compiles the generated C with g++, so the CBLAS enums in
+        # cblas.h are typed and int literals from call_extern are rejected;
+        # -fpermissive keeps the (correct) integer values usable.
+        flags.extend(["-include", "cblas.h", "-fpermissive", lib, "-lm"])
 
     return flags
