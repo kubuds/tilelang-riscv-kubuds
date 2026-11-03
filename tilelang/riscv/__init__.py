@@ -12,3 +12,5 @@ from __future__ import annotations
 from .backend import BACKEND
 
 __all__ = ["BACKEND"]
+
+from . import gemm_riscv as gemm_riscv  # noqa: E402,F401  registers the GEMM impl
