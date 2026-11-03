@@ -70,3 +70,41 @@ was in the vtype setup before it. See `probe_vsetvli_zero_trap.c`.
    against 22-24 for int8 because unpacking costs 13 vector instructions per 32
    weights; cutting that to ~9 (fold the -8 offset into one correction term per
    block) is the cheapest remaining lever, worth ~1.3-1.4x.
+
+## Achievable decode ceiling on this chip (arithmetic, from measurements)
+
+Qwen3-0.6B int8 streams 654 MB/token. Measured rates:
+
+    X100 RVV int8 GEMV, 7 threads, in-engine     16.0 GB/s  -> 41 ms -> 24 tok/s
+    llama.cpp(SpacemiT) Q8_0                     18.3 GB/s  -> 33 ms -> 30 tok/s
+    DRAM peak (streaming, measured elsewhere)    ~21   GB/s
+
+To beat 30.2 tok/s we need >19.8 GB/s end to end, i.e. above the vendors own
+## Achievable decode ceiling on this chip (arithmetic, from measurements)
+
+Qwen3-0.6B int8 streams 654 MB/token. Measured rates:
+
+    X100 RVV int8 GEMV, 7 threads, in-engine     16.0 GB/s  -> 41 ms -> 24 tok/s
+    llama.cpp(SpacemiT) Q8_0                     18.3 GB/s  -> 33 ms -> 30 tok/s
+    DRAM peak (streaming, measured elsewhere)    ~21   GB/s
+
+To beat 30.2 tok/s we need more than 19.8 GB/s end to end, i.e. above the
+vendor's own rate, with essentially zero non-GEMV overhead. Our 41 ms breaks
+down as about 33 ms of weight streaming plus about 8 ms of attention, norm,
+SiLU, argmax and FFI. Even perfect overhead removal lands at 28-30 tok/s,
+i.e. parity.
+
+The only way to go clearly past it is fewer bytes: 4-bit weights. Every route
+to that on this silicon is closed as measured:
+
+  - software unpack on X100: 13 vector instructions per 32 weights, 14 GMAC/s
+    against 19 for int8, i.e. 60 ms/token (16.5 tok/s). Cutting the offset
+    term gets to about 11 instructions, still below the int8 rate per MAC; it
+    cannot reach the 31 GMAC/s that would make it memory-bound.
+  - vmadot.hp i4 on A100: requires Int4 x Int4, i.e. 4-bit activations.
+  - vmadot.hp i8 on A100: same bytes, and small matrices reach only 9-11 GB/s
+    there (41.5 ms for the layer GEMMs alone).
+
+So on K3 the realistic outcome for a TileLang + RVV/IME2 decoder is parity
+with the vendor backend, not a win. Beating it needs a weight/activation
+format this ISA does not expose.
