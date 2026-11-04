@@ -184,6 +184,78 @@ static inline void gemv_q8_m8_impl(int N, int K, const uint8_t *q,
   }
 }
 
+/* K-blocked M=8 Q8 GEMV for the wide-K projections (down_proj: K = IM).
+ *
+ * The plain gemv_q8_m8 walks x (8 rows x K floats) once per output row.  At
+ * K=1024 that tile is 32 KB and stays in L1; at K=3072 it is 96 KB and every
+ * output row re-reads it from L2, which measures 1.1 GB/s against 16.4 for
+ * K=1024.  Walking K in 512-element chunks keeps the slice L1-resident while
+ * the output rows loop inside it.
+ *
+ * Chunking costs about 3x on the K<=1024 shapes (5.1 vs 16.4 GB/s, an artefact
+ * of the k0-dependent addressing defeating the scheduler), so callers use this
+ * entry point only for the wide-K matrices; gemv_q8_m8 stays for the rest.
+ */
+static inline void gemv_q8_m8_kb_impl(int N, int K, const uint8_t *q,
+                                      const uint16_t *s, const float *x,
+                                      float *y) {
+  const int kb = K >> 5;
+  const int8_t *w = (const int8_t *)q;
+  const int KB = 512;
+
+  for (int m = 0; m < 8; ++m)
+    memset(y + (size_t)m * N, 0, (size_t)N * sizeof(float));
+
+  for (int k0 = 0; k0 < K; k0 += KB) {
+    const int klen = (K - k0 < KB) ? (K - k0) : KB;
+    const int nb = klen >> 5;
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static)
+#endif
+    for (int n = 0; n < N; ++n) {
+      const int8_t *wr = w + (size_t)n * K + k0;
+      const uint16_t *sr = s + (size_t)n * kb + (k0 >> 5);
+      size_t vl = __riscv_vsetvl_e32m1((size_t)8);
+      vfloat32m1_t a0 = __riscv_vfmv_v_f_f32m1(0.0f, vl);
+      vfloat32m1_t a1 = __riscv_vfmv_v_f_f32m1(0.0f, vl);
+      vfloat32m1_t a2 = __riscv_vfmv_v_f_f32m1(0.0f, vl);
+      vfloat32m1_t a3 = __riscv_vfmv_v_f_f32m1(0.0f, vl);
+      vfloat32m1_t a4 = __riscv_vfmv_v_f_f32m1(0.0f, vl);
+      vfloat32m1_t a5 = __riscv_vfmv_v_f_f32m1(0.0f, vl);
+      vfloat32m1_t a6 = __riscv_vfmv_v_f_f32m1(0.0f, vl);
+      vfloat32m1_t a7 = __riscv_vfmv_v_f_f32m1(0.0f, vl);
+      for (int b = 0; b < nb; ++b) {
+        const int off = k0 + (b << 5);
+        const float sc = half_to_float(sr[b]);
+        for (int t = 0; t < 4; ++t) {
+          const int o2 = off + (t << 3);
+          size_t v8 = __riscv_vsetvl_e8mf4((size_t)8);
+          vint8mf4_t wv = __riscv_vle8_v_i8mf4(wr + (b << 5) + (t << 3), v8);
+          vfloat32m1_t wf =
+              __riscv_vfcvt_f_x_v_f32m1(__riscv_vsext_vf4_i32m1(wv, v8), v8);
+          wf = __riscv_vfmul_vf_f32m1(wf, sc, v8);
+          a0 = __riscv_vfmacc_vv_f32m1(a0, wf, __riscv_vle32_v_f32m1(x + o2, v8), v8);
+          a1 = __riscv_vfmacc_vv_f32m1(a1, wf, __riscv_vle32_v_f32m1(x + K + o2, v8), v8);
+          a2 = __riscv_vfmacc_vv_f32m1(a2, wf, __riscv_vle32_v_f32m1(x + 2 * K + o2, v8), v8);
+          a3 = __riscv_vfmacc_vv_f32m1(a3, wf, __riscv_vle32_v_f32m1(x + 3 * K + o2, v8), v8);
+          a4 = __riscv_vfmacc_vv_f32m1(a4, wf, __riscv_vle32_v_f32m1(x + 4 * K + o2, v8), v8);
+          a5 = __riscv_vfmacc_vv_f32m1(a5, wf, __riscv_vle32_v_f32m1(x + 5 * K + o2, v8), v8);
+          a6 = __riscv_vfmacc_vv_f32m1(a6, wf, __riscv_vle32_v_f32m1(x + 6 * K + o2, v8), v8);
+          a7 = __riscv_vfmacc_vv_f32m1(a7, wf, __riscv_vle32_v_f32m1(x + 7 * K + o2, v8), v8);
+        }
+      }
+      y[(size_t)0 * N + n] += hsum_f32m1(a0, vl);
+      y[(size_t)1 * N + n] += hsum_f32m1(a1, vl);
+      y[(size_t)2 * N + n] += hsum_f32m1(a2, vl);
+      y[(size_t)3 * N + n] += hsum_f32m1(a3, vl);
+      y[(size_t)4 * N + n] += hsum_f32m1(a4, vl);
+      y[(size_t)5 * N + n] += hsum_f32m1(a5, vl);
+      y[(size_t)6 * N + n] += hsum_f32m1(a6, vl);
+      y[(size_t)7 * N + n] += hsum_f32m1(a7, vl);
+    }
+  }
+}
+
 /* Q4 GEMV: same shape as gemv_q8, but 32 weights occupy 16 bytes plus one
  * fp16 scale (llama.cpp Q4_0 grid: byte j holds value j in the low nibble and
  * value j+16 in the high nibble, dequant (nibble-8)*scale).
@@ -434,6 +506,12 @@ static inline int32_t tl_riscv_gemv_q8(int32_t N, int32_t K, uint8_t *q,
 static inline int32_t tl_riscv_gemv_q4(int32_t N, int32_t K, uint8_t *q,
                                        uint8_t *sc, float *x, float *y) {
   tl::rv::gemv_q4_impl(N, K, q, sc, x, y);
+  return 0;
+}
+
+static inline int32_t tl_riscv_gemv_q8_m8_kb(int32_t N, int32_t K, uint8_t *q,
+                                             uint8_t *sc, float *x, float *y) {
+  tl::rv::gemv_q8_m8_kb_impl(N, K, q, (const uint16_t *)sc, x, y);
   return 0;
 }
 
