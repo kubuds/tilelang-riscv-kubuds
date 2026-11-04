@@ -82,6 +82,12 @@ static inline float half_to_float(uint16_t h) {
   return out;
 }
 
+static inline float hsum_f32m1(vfloat32m1_t v, size_t vl) {
+  vfloat32m1_t s = __riscv_vfredusum_vs_f32m1_f32m1(
+      v, __riscv_vfmv_v_f_f32m1(0.0f, 1), vl);
+  return __riscv_vfmv_f_s_f32m1_f32(s);
+}
+
 static inline float hsum_f32m4(vfloat32m4_t v, size_t vl) {
   vfloat32m1_t s = __riscv_vfredusum_vs_f32m4_f32m1(
       v, __riscv_vfmv_v_f_f32m1(0.0f, 1), vl);
@@ -132,39 +138,49 @@ static inline void gemv_q8_m8_impl(int N, int K, const uint8_t *q,
   for (int n = 0; n < N; ++n) {
     const int8_t *wr = w + (size_t)n * K;
     const uint16_t *sr = s + (size_t)n * kb;
-    size_t vl32 = __riscv_vsetvl_e32m4((size_t)32);
-    vfloat32m4_t a0 = __riscv_vfmv_v_f_f32m4(0.0f, vl32);
-    vfloat32m4_t a1 = __riscv_vfmv_v_f_f32m4(0.0f, vl32);
-    vfloat32m4_t a2 = __riscv_vfmv_v_f_f32m4(0.0f, vl32);
-    vfloat32m4_t a3 = __riscv_vfmv_v_f_f32m4(0.0f, vl32);
-    vfloat32m4_t a4 = __riscv_vfmv_v_f_f32m4(0.0f, vl32);
-    vfloat32m4_t a5 = __riscv_vfmv_v_f_f32m4(0.0f, vl32);
-    vfloat32m4_t a6 = __riscv_vfmv_v_f_f32m4(0.0f, vl32);
-    vfloat32m4_t a7 = __riscv_vfmv_v_f_f32m4(0.0f, vl32);
+    /* Eight accumulators of 32-bit lanes fill the whole register file when the
+     * lane width is m4 (8 x 4 = 32 registers) and the kernel spills: 3.6 GB/s.
+     * With m1 (8 lanes) the eight accumulators take 8 registers and the kernel
+     * streams at 16.0 GB/s, which is the same rate the M=1 GEMV gets for one
+     * row -- eight rows for the price of one weight read.  The block is
+     * therefore split into four 8-weight slices. */
+    size_t vl = __riscv_vsetvl_e32m1((size_t)8);
+    vfloat32m1_t a0 = __riscv_vfmv_v_f_f32m1(0.0f, vl);
+    vfloat32m1_t a1 = __riscv_vfmv_v_f_f32m1(0.0f, vl);
+    vfloat32m1_t a2 = __riscv_vfmv_v_f_f32m1(0.0f, vl);
+    vfloat32m1_t a3 = __riscv_vfmv_v_f_f32m1(0.0f, vl);
+    vfloat32m1_t a4 = __riscv_vfmv_v_f_f32m1(0.0f, vl);
+    vfloat32m1_t a5 = __riscv_vfmv_v_f_f32m1(0.0f, vl);
+    vfloat32m1_t a6 = __riscv_vfmv_v_f_f32m1(0.0f, vl);
+    vfloat32m1_t a7 = __riscv_vfmv_v_f_f32m1(0.0f, vl);
     for (int b = 0; b < kb; ++b) {
       const int off = b << 5;
-      size_t vl = __riscv_vsetvl_e8m1((size_t)32);
-      vint8m1_t wv = __riscv_vle8_v_i8m1(wr + off, vl);
-      vfloat32m4_t wf =
-          __riscv_vfcvt_f_x_v_f32m4(__riscv_vsext_vf4_i32m4(wv, vl), vl);
-      wf = __riscv_vfmul_vf_f32m4(wf, half_to_float(sr[b]), vl);
-      a0 = __riscv_vfmacc_vv_f32m4(a0, wf, __riscv_vle32_v_f32m4(x + off, vl), vl);
-      a1 = __riscv_vfmacc_vv_f32m4(a1, wf, __riscv_vle32_v_f32m4(x + K + off, vl), vl);
-      a2 = __riscv_vfmacc_vv_f32m4(a2, wf, __riscv_vle32_v_f32m4(x + 2 * K + off, vl), vl);
-      a3 = __riscv_vfmacc_vv_f32m4(a3, wf, __riscv_vle32_v_f32m4(x + 3 * K + off, vl), vl);
-      a4 = __riscv_vfmacc_vv_f32m4(a4, wf, __riscv_vle32_v_f32m4(x + 4 * K + off, vl), vl);
-      a5 = __riscv_vfmacc_vv_f32m4(a5, wf, __riscv_vle32_v_f32m4(x + 5 * K + off, vl), vl);
-      a6 = __riscv_vfmacc_vv_f32m4(a6, wf, __riscv_vle32_v_f32m4(x + 6 * K + off, vl), vl);
-      a7 = __riscv_vfmacc_vv_f32m4(a7, wf, __riscv_vle32_v_f32m4(x + 7 * K + off, vl), vl);
+      const float sc = half_to_float(sr[b]);
+      for (int t = 0; t < 4; ++t) {
+        const int o2 = off + (t << 3);
+        size_t v8 = __riscv_vsetvl_e8mf4((size_t)8);
+        vint8mf4_t wv = __riscv_vle8_v_i8mf4(wr + o2, v8);
+        vfloat32m1_t wf =
+            __riscv_vfcvt_f_x_v_f32m1(__riscv_vsext_vf4_i32m1(wv, v8), v8);
+        wf = __riscv_vfmul_vf_f32m1(wf, sc, v8);
+        a0 = __riscv_vfmacc_vv_f32m1(a0, wf, __riscv_vle32_v_f32m1(x + o2, v8), v8);
+        a1 = __riscv_vfmacc_vv_f32m1(a1, wf, __riscv_vle32_v_f32m1(x + K + o2, v8), v8);
+        a2 = __riscv_vfmacc_vv_f32m1(a2, wf, __riscv_vle32_v_f32m1(x + 2 * K + o2, v8), v8);
+        a3 = __riscv_vfmacc_vv_f32m1(a3, wf, __riscv_vle32_v_f32m1(x + 3 * K + o2, v8), v8);
+        a4 = __riscv_vfmacc_vv_f32m1(a4, wf, __riscv_vle32_v_f32m1(x + 4 * K + o2, v8), v8);
+        a5 = __riscv_vfmacc_vv_f32m1(a5, wf, __riscv_vle32_v_f32m1(x + 5 * K + o2, v8), v8);
+        a6 = __riscv_vfmacc_vv_f32m1(a6, wf, __riscv_vle32_v_f32m1(x + 6 * K + o2, v8), v8);
+        a7 = __riscv_vfmacc_vv_f32m1(a7, wf, __riscv_vle32_v_f32m1(x + 7 * K + o2, v8), v8);
+      }
     }
-    y[(size_t)0 * N + n] = hsum_f32m4(a0, vl32);
-    y[(size_t)1 * N + n] = hsum_f32m4(a1, vl32);
-    y[(size_t)2 * N + n] = hsum_f32m4(a2, vl32);
-    y[(size_t)3 * N + n] = hsum_f32m4(a3, vl32);
-    y[(size_t)4 * N + n] = hsum_f32m4(a4, vl32);
-    y[(size_t)5 * N + n] = hsum_f32m4(a5, vl32);
-    y[(size_t)6 * N + n] = hsum_f32m4(a6, vl32);
-    y[(size_t)7 * N + n] = hsum_f32m4(a7, vl32);
+    y[(size_t)0 * N + n] = hsum_f32m1(a0, vl);
+    y[(size_t)1 * N + n] = hsum_f32m1(a1, vl);
+    y[(size_t)2 * N + n] = hsum_f32m1(a2, vl);
+    y[(size_t)3 * N + n] = hsum_f32m1(a3, vl);
+    y[(size_t)4 * N + n] = hsum_f32m1(a4, vl);
+    y[(size_t)5 * N + n] = hsum_f32m1(a5, vl);
+    y[(size_t)6 * N + n] = hsum_f32m1(a6, vl);
+    y[(size_t)7 * N + n] = hsum_f32m1(a7, vl);
   }
 }
 
