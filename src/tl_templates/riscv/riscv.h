@@ -64,8 +64,13 @@ namespace rv {
  *  * the k loop runs over MR=8 rows at once.  A single row leaves only one
  *    dependent vfmacc chain; vfmacc latency (~8-10 cycles) then dominates and
  *    the kernel measures 4.4 GFLOP/s per core.  Eight independent chains
- *    turn the same loop into an issue-bound one (see bench_riscv_gemm.py for
- *    the before/after numbers).
+ *    turn the same loop into an issue-bound one.
+ *  * the column vector is e32m2 (16 lanes at VLEN=256), not e32m1.  With m1 a
+ *    256-wide B panel is swept 32 times per k step and the 2 KB-strided loads
+ *    dominate; m2 halves that.  Measured through bench_riscv_gemm.py on X100:
+ *    m1 5.5 GFLOP/s, m2 30.1-31.3 GFLOP/s at 4 threads.  Eight threads collapse
+ *    the panel streaming to 5.9 GFLOP/s, so 4 is the thread count to use for
+ *    this kernel (the memory-bound GEMV path is the opposite: 7).
  *
  * beta semantics follow BLAS: beta==0 overwrites C (first k tile),
  * beta==1 accumulates (subsequent tiles).
@@ -88,16 +93,16 @@ static inline void gemm_f32_impl(int M, int N, int K, const float *A,
     for (int i0 = 0; i0 < M; i0 += MR) {
       if (i0 + MR <= M) {
         for (int j = 0; j < jn;) {
-          size_t vl = __riscv_vsetvl_e32m1((size_t)(jn - j));
+          size_t vl = __riscv_vsetvl_e32m2((size_t)(jn - j));
           const float *b = B + (size_t)jp + j;
-          vfloat32m1_t a0 = __riscv_vfmv_v_f_f32m1(0.0f, vl);
-          vfloat32m1_t a1 = __riscv_vfmv_v_f_f32m1(0.0f, vl);
-          vfloat32m1_t a2 = __riscv_vfmv_v_f_f32m1(0.0f, vl);
-          vfloat32m1_t a3 = __riscv_vfmv_v_f_f32m1(0.0f, vl);
-          vfloat32m1_t a4 = __riscv_vfmv_v_f_f32m1(0.0f, vl);
-          vfloat32m1_t a5 = __riscv_vfmv_v_f_f32m1(0.0f, vl);
-          vfloat32m1_t a6 = __riscv_vfmv_v_f_f32m1(0.0f, vl);
-          vfloat32m1_t a7 = __riscv_vfmv_v_f_f32m1(0.0f, vl);
+          vfloat32m2_t a0 = __riscv_vfmv_v_f_f32m2(0.0f, vl);
+          vfloat32m2_t a1 = __riscv_vfmv_v_f_f32m2(0.0f, vl);
+          vfloat32m2_t a2 = __riscv_vfmv_v_f_f32m2(0.0f, vl);
+          vfloat32m2_t a3 = __riscv_vfmv_v_f_f32m2(0.0f, vl);
+          vfloat32m2_t a4 = __riscv_vfmv_v_f_f32m2(0.0f, vl);
+          vfloat32m2_t a5 = __riscv_vfmv_v_f_f32m2(0.0f, vl);
+          vfloat32m2_t a6 = __riscv_vfmv_v_f_f32m2(0.0f, vl);
+          vfloat32m2_t a7 = __riscv_vfmv_v_f_f32m2(0.0f, vl);
           const float *r0 = A + (size_t)(i0 + 0) * lda;
           const float *r1 = A + (size_t)(i0 + 1) * lda;
           const float *r2 = A + (size_t)(i0 + 2) * lda;
@@ -107,15 +112,15 @@ static inline void gemm_f32_impl(int M, int N, int K, const float *A,
           const float *r6 = A + (size_t)(i0 + 6) * lda;
           const float *r7 = A + (size_t)(i0 + 7) * lda;
           for (int k = 0; k < K; ++k) {
-            vfloat32m1_t bv = __riscv_vle32_v_f32m1(b + (size_t)k * ldb, vl);
-            a0 = __riscv_vfmacc_vf_f32m1(a0, r0[k], bv, vl);
-            a1 = __riscv_vfmacc_vf_f32m1(a1, r1[k], bv, vl);
-            a2 = __riscv_vfmacc_vf_f32m1(a2, r2[k], bv, vl);
-            a3 = __riscv_vfmacc_vf_f32m1(a3, r3[k], bv, vl);
-            a4 = __riscv_vfmacc_vf_f32m1(a4, r4[k], bv, vl);
-            a5 = __riscv_vfmacc_vf_f32m1(a5, r5[k], bv, vl);
-            a6 = __riscv_vfmacc_vf_f32m1(a6, r6[k], bv, vl);
-            a7 = __riscv_vfmacc_vf_f32m1(a7, r7[k], bv, vl);
+            vfloat32m2_t bv = __riscv_vle32_v_f32m2(b + (size_t)k * ldb, vl);
+            a0 = __riscv_vfmacc_vf_f32m2(a0, r0[k], bv, vl);
+            a1 = __riscv_vfmacc_vf_f32m2(a1, r1[k], bv, vl);
+            a2 = __riscv_vfmacc_vf_f32m2(a2, r2[k], bv, vl);
+            a3 = __riscv_vfmacc_vf_f32m2(a3, r3[k], bv, vl);
+            a4 = __riscv_vfmacc_vf_f32m2(a4, r4[k], bv, vl);
+            a5 = __riscv_vfmacc_vf_f32m2(a5, r5[k], bv, vl);
+            a6 = __riscv_vfmacc_vf_f32m2(a6, r6[k], bv, vl);
+            a7 = __riscv_vfmacc_vf_f32m2(a7, r7[k], bv, vl);
           }
           float *c0 = C + (size_t)(i0 + 0) * ldc + jp + j;
           float *c1 = C + (size_t)(i0 + 1) * ldc + jp + j;
@@ -126,23 +131,23 @@ static inline void gemm_f32_impl(int M, int N, int K, const float *A,
           float *c6 = C + (size_t)(i0 + 6) * ldc + jp + j;
           float *c7 = C + (size_t)(i0 + 7) * ldc + jp + j;
           if (beta != 0) {
-            a0 = __riscv_vfadd_vv_f32m1(a0, __riscv_vle32_v_f32m1(c0, vl), vl);
-            a1 = __riscv_vfadd_vv_f32m1(a1, __riscv_vle32_v_f32m1(c1, vl), vl);
-            a2 = __riscv_vfadd_vv_f32m1(a2, __riscv_vle32_v_f32m1(c2, vl), vl);
-            a3 = __riscv_vfadd_vv_f32m1(a3, __riscv_vle32_v_f32m1(c3, vl), vl);
-            a4 = __riscv_vfadd_vv_f32m1(a4, __riscv_vle32_v_f32m1(c4, vl), vl);
-            a5 = __riscv_vfadd_vv_f32m1(a5, __riscv_vle32_v_f32m1(c5, vl), vl);
-            a6 = __riscv_vfadd_vv_f32m1(a6, __riscv_vle32_v_f32m1(c6, vl), vl);
-            a7 = __riscv_vfadd_vv_f32m1(a7, __riscv_vle32_v_f32m1(c7, vl), vl);
+            a0 = __riscv_vfadd_vv_f32m2(a0, __riscv_vle32_v_f32m2(c0, vl), vl);
+            a1 = __riscv_vfadd_vv_f32m2(a1, __riscv_vle32_v_f32m2(c1, vl), vl);
+            a2 = __riscv_vfadd_vv_f32m2(a2, __riscv_vle32_v_f32m2(c2, vl), vl);
+            a3 = __riscv_vfadd_vv_f32m2(a3, __riscv_vle32_v_f32m2(c3, vl), vl);
+            a4 = __riscv_vfadd_vv_f32m2(a4, __riscv_vle32_v_f32m2(c4, vl), vl);
+            a5 = __riscv_vfadd_vv_f32m2(a5, __riscv_vle32_v_f32m2(c5, vl), vl);
+            a6 = __riscv_vfadd_vv_f32m2(a6, __riscv_vle32_v_f32m2(c6, vl), vl);
+            a7 = __riscv_vfadd_vv_f32m2(a7, __riscv_vle32_v_f32m2(c7, vl), vl);
           }
-          __riscv_vse32_v_f32m1(c0, a0, vl);
-          __riscv_vse32_v_f32m1(c1, a1, vl);
-          __riscv_vse32_v_f32m1(c2, a2, vl);
-          __riscv_vse32_v_f32m1(c3, a3, vl);
-          __riscv_vse32_v_f32m1(c4, a4, vl);
-          __riscv_vse32_v_f32m1(c5, a5, vl);
-          __riscv_vse32_v_f32m1(c6, a6, vl);
-          __riscv_vse32_v_f32m1(c7, a7, vl);
+          __riscv_vse32_v_f32m2(c0, a0, vl);
+          __riscv_vse32_v_f32m2(c1, a1, vl);
+          __riscv_vse32_v_f32m2(c2, a2, vl);
+          __riscv_vse32_v_f32m2(c3, a3, vl);
+          __riscv_vse32_v_f32m2(c4, a4, vl);
+          __riscv_vse32_v_f32m2(c5, a5, vl);
+          __riscv_vse32_v_f32m2(c6, a6, vl);
+          __riscv_vse32_v_f32m2(c7, a7, vl);
           j += (int)vl;
         }
       } else {
