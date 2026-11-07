@@ -1,0 +1,117 @@
+# K3 具身智能负载盘点与实测（2026-11-07）
+
+平台：进迭时空 K3，8×X100（RVV VLEN=256）+ 8×A100（IME2），31 GB 内存，Bianbu，ROS2 Humble
+目的：找出还能在 K3 上跑的具身模型 / 算法 / ROS2 组件，实测并给出并发余量。
+
+## 1. 结论
+
+- **能闭环的只有 ACT 这一档**（~50M 参数）：int8 每 chunk 2.77 s，输出 100 步，按 30 Hz 执行可覆盖 3.3 s，刚好够用。
+- **smolVLA 这一档（450M）在纯 CPU 上是演示级**：单个 chunk 33.7 s，其中视觉编码器就占 23.1 s。
+- **AI 核（A100/IME2）这条加速路径当前不可用**：ONNX Runtime 的 SpaceMIT EP 报 `tcm buffer acquire failed for core id 0`，因为系统只有 `/dev/tcm`，没有 `/dev/tcm_sync_mem`，也没有任何 tcm 内核模块。
+- **8 核没被打满**：ACT int8 + llama.cpp 8B 同时跑，CPU 用户态仅 1%，内核态 78%，空闲 15%，两个任务各自只慢 6% 以内。
+
+## 2. 盘子里已有什么（不需要重新下载）
+
+| 类别 | 已有 | 大小 |
+|---|---|---|
+| VLA | ACT（fp32/int8 ONNX）、smolVLA（4 段 ONNX）、lingbot_vla_4b、robobrain、go1、eventvla、worldvla、turbovla、omnivla | 19 MB – 16 GB |
+| 感知 | dinov3 ViT-L、bert | 382 MB / 419 MB |
+| 中间件 | ROS2 Humble + nav2 全家桶 + controller_manager + moveit 控制器 | /opt/ros/humble |
+| 运行时 | onnxruntime 1.24.2+spacemit.a1（CPU + SpaceMIT EP）、torch 2.8+spacemit、TileLang 后端 | — |
+
+## 3. 搜索到的新模型与 K3 可行性判断
+
+| 模型 | 发布 | 规模 | 动作头 | K3 判断 |
+|---|---|---|---|---|
+| MiniCPM-RobotManip | 2026-07 面壁 | 1.5B | VLA，配套 PhyAI 框架 | 需要其专属推理框架；CPU 预计与 smolVLA 同量级，暂不划算 |
+| π-fast | 2025H2 PI | π0 减半 | flow matching | 权重未开源 |
+| TinyVLA | 2025 | <1B | diffusion | **值得试**：视觉塔比 smolVLA 小 |
+| BitVLA | 2026 | 1.58-bit | 三值权重 | **值得试**：权重可压到 0.4 GB 量级，但需要 bitnet 推理支持 |
+| NanoVLA | 2026 | 论文级 | — | 代码未放 |
+| RynnBrain | 2026-02 阿里 | 2B/4B/8B | System-2 规划（离散坐标 token） | 2B 可加载，定位是"大脑"不是控制环 |
+| Qwen-VLA | 2026-05 | 4B VLM + 1.15B DiT | flow matching | 太大，CPU 不现实 |
+| G0 Tiny | 2025-09 星海图 | 端侧 | — | 权重未完全开放 |
+
+排序建议：TinyVLA → BitVLA → RynnBrain-2B（只做规划侧）。
+
+## 4. 实测（K3 本机，CPU EP，8 线程）
+
+### 4.1 ACT（SO-101 抓绿方块，2 路 480×640）
+
+| 版本 | 加载 | 单 chunk（100 步） | 折算 |
+|---|---:|---:|---:|
+| fp32 ONNX | 0.90 s | 3.82 s | 0.26 Hz |
+| int8 ONNX | 0.44 s | 2.77 s | 0.36 Hz |
+
+闭环判断：30 Hz 执行时一个 chunk 覆盖 3.33 s，int8 推理 2.77 s，余量 0.56 s（17%）。
+
+### 4.2 smolVLA（4 段 ONNX，512×512 双路）
+
+| 阶段 | 耗时 |
+|---|---:|
+| 加载 4 个 session | 6.69 s |
+| vision_encoder + connector | **23.13 s** |
+| prefill_lm（kv 16×1×177×5×64） | 2.98 s |
+| denoise ×10 | 7.55 s（755 ms/步） |
+| 合计 / chunk | **33.7 s → 0.030 Hz** |
+
+瓶颈明确：视觉编码器占 69%，denoise 循环占 22%，动作头本身不贵。
+
+### 4.3 SpaceMIT EP（AI 核）
+
+```
+onnxruntime ... RuntimeException: Non-zero status code returned while running
+SpineSubgraph node ... Status Message: tcm buffer acquire failed for core id 0.
+```
+
+现场检查：
+
+- `/dev/tcm` 存在（misc 10:260），`/dev/tcm_sync_mem` 不存在；
+- `lsmod` 无 tcm/spacemit 相关模块，`/proc/devices` 无 tcm 条目；
+- llama.cpp 启动时同样打印 `alloc_chunk: open(/dev/tcm_sync_mem) failed, errno=2`，随后回退到堆。
+
+所以这不是模型问题，是板上 TCM 设备节点缺失。修法（需要厂商内核包）：装上提供 `/dev/tcm_sync_mem` 的驱动模块并给 udev 规则；否则 ONNX EP 和 llama.cpp 的 IME2 都只能走回退路径。
+
+### 4.4 并发余量
+
+ACT int8（3 次 chunk）与 llama.cpp Qwen3-8B Q4_K_M（tg64, 4 线程）同时跑：
+
+| 任务 | 单独 | 并发 | 变化 |
+|---|---:|---:|---:|
+| ACT int8 | 2.77 s/chunk | 2.94 s/chunk | +6% |
+| llama.cpp 8B decode | 3.92 tok/s（4 线程） | 3.97 tok/s | 持平 |
+
+`vmstat` 平均：us 1%，sy 78%，idle 15%。内核态占比高是 ONNX/OpenMP 自旋造成的，实际算力仍有约 15% 空闲，可以再叠一个 TileLang 推理或 ROS2 节点。
+
+### 4.5 ROS2
+
+- `rclpy` 正常，Humble + nav2 包齐全；`demo_nodes_cpp` 未安装（用自写节点验证）。
+- 两进程发布速率：256 B 消息 **6112 msg/s（1.6 MB/s）**；4 KB 消息 **921 msg/s（3.8 MB/s）**。
+- 64 KB 场景在本轮测试里 publisher context 提前失效，未取到稳定值，属于测试脚本问题，不是链路问题。
+
+## 5. 复现
+
+```bash
+# ACT int8（CPU EP）
+python /work/kubuds/hermes/vla_test/act_onnx_infer.py --ep cpu
+
+# smolVLA（4 段 ONNX，10 步去噪）
+python /work/kubuds/hermes/vla_test/smolvla_onnx_infer.py --ep cpu --steps 10
+
+# 并发：ACT + 8B decode
+bash /tmp/conc2.sh
+
+# ROS2 两进程吞吐
+source /opt/ros/humble/setup.bash
+python3 /tmp/ros2_pubsub.py sub 3000 4096 &
+python3 /tmp/ros2_pubsub.py pub 3000 4096
+```
+
+脚本已归档到仓库 `testing/embodied/`：`ros2_pubsub.py`、`conc_bench.sh`、`act_smolvla_bench.md`。
+
+## 6. 下一步
+
+1. 补 `/dev/tcm_sync_mem`（厂商内核模块），再测 SpaceMIT EP——这是把 smolVLA 从 33.7 s 拉到可用的唯一现实路径。
+2. 视觉编码器单独 int8 量化（占 69%），比整模型量化收益更集中。
+3. 试 TinyVLA（视觉塔更小）与 BitVLA（权重 1.58-bit）。
+4. 若要多任务压满 8 核：ACT + 8B decode + ROS2 已能共存，再加 TileLang 的 0.6B 推理仍有余量，但要注意 31 GB 内存（8B 两份权重就 9.3 GB + 4.7 GB）。
