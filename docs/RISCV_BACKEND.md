@@ -105,9 +105,11 @@ Measured (K3, OMP_NUM_THREADS=7, greedy, 128-token cache):
 
 | model | weights | prefill | decode | same-board llama.cpp |
 |---|---:|---:|---:|---:|
-| Qwen3-0.6B | 0.94 GB | 25 ms/token (batched) | **22-25 tok/s** | 30.2 (Q8_0) |
+| Qwen3-0.6B (int8) | 0.94 GB | 25 ms/token (batched) | 22-25 tok/s | 30.2 (Q8_0) |
+| Qwen3-0.6B (Q4_0 + IME2) | 0.65 GB | 25 ms/token | **44-46 tok/s** | 53.4 (Q4_0) |
+| DS-R1-Distill-1.5B (Q4_0 + IME2) | 1.35 GB | 75 ms/token | **16.3 tok/s** | 16.2 (Q4_K_M) |
 | Qwen3-1.7B | 2.45 GB | 120 ms/token | 8.54 tok/s | 15.73 (Q4_K_M) |
-| DeepSeek-R1-Distill-1.5B | 2.13 GB | 120-224 ms/token | 8.5 tok/s | 16.22 (Q4_K_M) |
+| DS-R1-Distill-1.5B (int8) | 2.13 GB | 120-224 ms/token | 8.5 tok/s | 16.22 (Q4_K_M) |
 | Qwen3-8B | 9.29 GB | 533 ms/token | 1.95 tok/s | 4.46 (Q4_K_M) |
 
 All four produce coherent continuations; the tokenizer and prompts are shared
@@ -126,6 +128,43 @@ down_proj (K = IM) is sliced into 1024-element calls. A whole-K call re-walks an
 8xK activation tile (96 KB at 0.6B, 393 KB at 8B) once per output row and drops
 to 1.1 GB/s; slicing keeps each tile at 32 KB in L1 and costs one OpenMP region
 per call: 2.80 -> 0.64 ms per layer, 629 -> 558 ms for a 20-token prefill.
+
+
+### 4b. Q4_0 on the A100 IME2 engine (decode)
+
+Decode is memory-bound, so the winning move is fewer bytes plus a faster
+memory path, not a better kernel.  Q4_0 tiles fed to the vendor IME2 i8i4
+kernel sustain 19-22 GB/s on the A100 cluster and read 4.5 bits per weight,
+against 15.3 GB/s for int8 on X100: 1.9x end to end, both models.
+
+    target layout "ime2q4"  ->  tl_riscv_gemv_q4_ime2  ->  libime2bridge.so
+                                (spert, 4 A100 workers, RTLD_GLOBAL like BLAS)
+
+Per-operator, Qwen3-0.6B shapes, 4 workers:
+
+| N x K | time | bandwidth |
+|---|---:|---:|
+| 1024 x 1024 (k/v) | 0.031 ms | 19.3 GB/s |
+| 1024 x 3072 (down) | 0.090 ms | 19.6 GB/s |
+| 3072 x 1024 (gate/up) | 0.087 ms | 20.4 GB/s |
+| 4096 x 1024 (q/o) | 0.113 ms | 20.9 GB/s |
+| 151936 x 1024 (head) | 4.016 ms | 21.8 GB/s |
+
+Exporters: `make_q4_blob.py` (Q4_0 GGUF, blocks copied verbatim) and
+`make_q4_blob_hf.py` (safetensors, quantising inline; byte-identical to
+llama.cpp's Q4_0 on the same tensor).  Two shape traps: the blob must store the
+*padded* KV head count in `NKV` and the real GQA group in `nkv_attn`, and
+Qwen2-style attention biases go into one contiguous `qkv_bias` block.
+
+Prefill stays on RVV because the IME2 kernel is M=1; that is the largest
+remaining gap (25 ms/token vs llama.cpp's 3.3 ms/token on 0.6B).
+
+### 4c. Thread count for OpenBLAS
+
+OpenBLAS sizes its pool from `OPENBLAS_NUM_THREADS`, not `OMP_NUM_THREADS`.
+Bare cblas 512^3 on this board: 80.9 GFLOP/s at 4, 34.9 at 8.  The 40.4
+GFLOP/s previously recorded for `blas="openblas"` was the oversubscribed case;
+`testing/riscv/gemm/cblas_bench.c` reproduces both.
 
 ## 5. Compiler fixes found on the way
 
