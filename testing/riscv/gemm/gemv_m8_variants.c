@@ -56,7 +56,7 @@ static inline float h2f(uint16_t h) {
       VT a7 = __riscv_vfmv_v_f_f32##LMUL(0.f, vl);                            \
       for (int b = 0; b < kb; ++b) {                                          \
         const int off = b << 5;                                               \
-        for (int t = 0; t < (int)vl / VLMAX_EXPR; ++t) {                      \
+        for (int t = 0; t < 32 / VLMAX_EXPR; ++t) {                      \
           const int o2 = off + t * VLMAX_EXPR;                                \
           size_t v8 = __riscv_vsetvl_e8##INLMUL((size_t)VLMAX_EXPR);          \
           vint8##INLMUL##_t wv = __riscv_vle8_v_i8##INLMUL(wr + o2, v8);      \

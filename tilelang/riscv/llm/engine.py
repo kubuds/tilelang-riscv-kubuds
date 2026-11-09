@@ -314,6 +314,12 @@ def build_layer_m8(m: Meta, maxseq: int, MR: int = 8):
     o = m.layer_off
     scale = 1.0 / (HD ** 0.5)
     GEMV = "tl_riscv_gemv_q4" if m.wbits == 4 else "tl_riscv_gemv_q8_m8"
+    # down_proj slices, computed outside the traced function: min()/comparisons
+    # on traced expressions are illegal inside @T.prim_func.
+    _KS = 1024
+    DOWN_SLICES = [(si * _KS, min(_KS, IM - si * _KS))
+                   for si in range((IM + _KS - 1) // _KS)]
+    GEMV_WIDE = GEMV
 
     @T.prim_func
     def layer(
@@ -406,9 +412,16 @@ def build_layer_m8(m: Meta, maxseq: int, MR: int = 8):
             for mm in range(MR):
                 _call("tl_riscv_silu_mul", IM, T.address_of(GUG[mm * IM]),
                       T.address_of(GUU[mm * IM]), T.address_of(GUG[mm * IM]))
-            _call(GEMV, H, IM, T.address_of(W[T.cast(b + o["wdown.q"], "int64")]),
-                  T.address_of(W[T.cast(b + o["wdown.s"], "int64")]),
-                  T.address_of(GUG[0]), T.address_of(XB[0]))
+            # down_proj is the only K=IM matrix.  Calling it in 1024-element
+            # slices keeps each 8x1024 activation tile in L1 (32 KB) and costs
+            # one OpenMP region per slice; the whole-K call re-reads a 96 KB
+            # (0.6B) to 393 KB (8B) tile per output row and runs at ~1.1 GB/s.
+            for si, (qoff, klen) in enumerate(DOWN_SLICES):
+                _call("tl_riscv_gemv_q8_m8_slice", H, klen,
+                      T.address_of(W[T.cast(b + o["wdown.q"] + qoff, "int64")]),
+                      T.address_of(W[T.cast(b + o["wdown.s"] + (qoff // 32) * 2, "int64")]),
+                      T.address_of(GUG[qoff]), T.address_of(XB[0]),
+                      0 if si == 0 else 1, IM, IM)
             for mm in range(MR):
                 _call("tl_riscv_add", H, T.address_of(X[mm * H]),
                       T.address_of(XB[mm * H]))
@@ -510,7 +523,18 @@ class Engine:
             self.f_head = tilelang.compile(build_head(m), out_idx=None,
                                            execution_backend="tvm_ffi")
             self.f_layer_m8 = None
+            # Measured: the batched layer is 1.4x faster at H=1024 (0.6B) but
+            # 5.5x SLOWER at H=4096 (8B, 3.0 s vs 0.54 s per token) -- the
+            # per-row work and the 12 down_proj slices per layer dominate once
+            # the weight matrices grow.  Gate it on the hidden size instead of
+            # shipping a regression.
+            if m.H > 2048:
+                self.build_s = time.time() - t0
+                print(f"[engine] batched prefill off for H={m.H} "
+                      f"(measured slower above H=2048)", flush=True)
             try:
+                if m.H > 2048:
+                    raise RuntimeError("batched prefill disabled for large models")
                 if os.environ.get("TL_NO_BATCH"):
                     raise RuntimeError("batched prefill disabled by TL_NO_BATCH")
                 self.f_layer_m8 = tilelang.compile(build_layer_m8(m, maxseq),
