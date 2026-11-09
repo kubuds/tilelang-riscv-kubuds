@@ -130,3 +130,7 @@ maint/host_checks/logs/*
 
 # uv Lockfile
 uv.lock
+
+# RISC-V build outputs
+build/
+build_riscv/
