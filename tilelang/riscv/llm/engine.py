@@ -63,6 +63,7 @@ class Meta:
     final_norm: int
     nkv_attn: int = 0
     wbits: int = 8
+    layout: str = "q8planar"   # "q8planar" (our RVV) or "ime2q4" (A100 IME2)
 
     @property
     def NQ(self):
@@ -71,6 +72,20 @@ class Meta:
     @property
     def KV(self):
         return self.NKV * self.HD
+
+
+def _gemv_name(m: Meta, batched: bool = False) -> str:
+    """GEMV symbol for this blob layout.
+
+    ime2q4 blobs hold the vendor's 32x32 Q4_0 tiles and are consumed by the A100
+    IME2 matrix engine (4 spert workers).  That kernel has no M=8 form, so
+    batched prefill stays on the RVV path and is only used for int8 blobs.
+    """
+    if m.layout == "ime2q4":
+        return "tl_riscv_gemv_q4_ime2"
+    if batched:
+        return "tl_riscv_gemv_q4" if m.wbits == 4 else "tl_riscv_gemv_q8_m8"
+    return "tl_riscv_gemv_q4" if m.wbits == 4 else "tl_riscv_gemv_q8"
 
 
 def _call(name, *args):
@@ -90,7 +105,7 @@ def build_step(m: Meta, maxseq: int):
     eps, LS = m.eps, m.layer_stride
     o = m.layer_off
     scale = 1.0 / (HD ** 0.5)
-    GEMV = "tl_riscv_gemv_q4" if m.wbits == 4 else "tl_riscv_gemv_q8"
+    GEMV = _gemv_name(m)
 
     @T.prim_func
     def step(
@@ -200,7 +215,7 @@ def build_layer(m: Meta, maxseq: int):
     eps = m.eps
     o = m.layer_off
     scale = 1.0 / (HD ** 0.5)
-    GEMV = "tl_riscv_gemv_q4" if m.wbits == 4 else "tl_riscv_gemv_q8"
+    GEMV = _gemv_name(m)
 
     @T.prim_func
     def layer(
@@ -313,7 +328,7 @@ def build_layer_m8(m: Meta, maxseq: int, MR: int = 8):
     eps = m.eps
     o = m.layer_off
     scale = 1.0 / (HD ** 0.5)
-    GEMV = "tl_riscv_gemv_q4" if m.wbits == 4 else "tl_riscv_gemv_q8_m8"
+    GEMV = _gemv_name(m, batched=True)
     # down_proj slices, computed outside the traced function: min()/comparisons
     # on traced expressions are illegal inside @T.prim_func.
     _KS = 1024
@@ -431,7 +446,7 @@ def build_layer_m8(m: Meta, maxseq: int, MR: int = 8):
 
 def build_head(m: Meta):
     H, V = m.H, m.V
-    GEMV = "tl_riscv_gemv_q4" if m.wbits == 4 else "tl_riscv_gemv_q8"
+    GEMV = _gemv_name(m)
 
     @T.prim_func
     def head(
@@ -463,6 +478,21 @@ class Engine:
         if not self.m.nkv_attn:
             self.m.nkv_attn = self.m.NKV
         self.maxseq = maxseq
+        if self.m.layout == "ime2q4":
+            # The A100 IME2 Q4 GEMV lives in libime2bridge.so (vendor spert
+            # kernels).  Load it RTLD_GLOBAL before the TileLang module does,
+            # the same contract the OpenBLAS path uses.
+            import ctypes
+            cands = [os.environ.get("IME2_BRIDGE", ""),
+                     os.path.join(os.path.dirname(__file__), "../../../build_riscv",
+                                  "libime2bridge.so"),
+                     "/usr/local/lib/libime2bridge.so"]
+            so = next((c for c in cands if c and os.path.exists(c)), None)
+            if not so:
+                raise RuntimeError(
+                    "ime2q4 blob needs libime2bridge.so; set IME2_BRIDGE")
+            ctypes.CDLL(so, mode=ctypes.RTLD_GLOBAL)
+            print(f"[engine] IME2 Q4 decode path ({so})", flush=True)
         self.w = np.memmap(blob_path, dtype=np.uint8, mode="c")
         assert self.w.size == self.m.nbytes, (self.w.size, self.m.nbytes)
         m = self.m
@@ -533,6 +563,8 @@ class Engine:
                 print(f"[engine] batched prefill off for H={m.H} "
                       f"(measured slower above H=2048)", flush=True)
             try:
+                if m.layout != "q8planar":
+                    raise RuntimeError("batched prefill needs the RVV Q8 kernel")
                 if m.H > 2048:
                     raise RuntimeError("batched prefill disabled for large models")
                 if os.environ.get("TL_NO_BATCH"):

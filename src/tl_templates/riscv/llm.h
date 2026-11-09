@@ -564,6 +564,26 @@ static inline void argmax_impl(int n, const float *x, int32_t *out) {
 
 extern "C" {
 
+/* Q4_0 tiles for the K3 A100 IME2 matrix engine.
+ *
+ * The kernel itself is the vendor's (SpacemiT, MIT): libime2bridge.so launches
+ * ime2::gemm_kernel_i8i4 on 4 A100 workers through spert.  The host must
+ * preload that .so with RTLD_GLOBAL -- the same contract as the OpenBLAS path,
+ * and the reason this stays a weak extern symbol rather than a hard link.
+ *
+ * Q4_0 already carries its own per-32 scale inside the tile, so sc is unused.
+ * Measured 19-22 GB/s on A100 vs 15.3 GB/s for our int8 RVV GEMV, at half the
+ * bytes per weight.
+ */
+extern "C" int ime2_gemv_q4(const void *packed, const float *x, float *y,
+                            int N, int K);
+
+static inline int32_t tl_riscv_gemv_q4_ime2(int32_t N, int32_t K, uint8_t *q,
+                                            uint8_t *sc, float *x, float *y) {
+  (void)sc;
+  return ime2_gemv_q4(q, x, y, (int)N, (int)K);
+}
+
 static inline int32_t tl_riscv_gemv_q8(int32_t N, int32_t K, uint8_t *q,
                                        uint8_t *sc, float *x, float *y) {
   tl::rv::gemv_q8_impl(N, K, q, sc, x, y);
