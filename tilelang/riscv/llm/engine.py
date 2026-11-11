@@ -629,8 +629,11 @@ class Engine:
         self.li = np.zeros(1, dtype=np.int32)
         self.ids = np.zeros(1, dtype=np.int32)
         # prefill batch buffers (MR=8 rows)
-        # 4 rows for the IME2 Q4 path (vendor m4 kernel), 8 for the RVV one
-        self.MR = 4 if m.layout == "ime2q4" else 8
+        # Prefill chunk size.  The IME2 path compiles several and picks one per
+        # prompt (see pref_plans); buffers are sized for the largest.
+        _mr_env = int(os.environ.get("TL_MR", "0"))
+        self.MR = _mr_env or (16 if m.layout == "ime2q4" else 8)
+        self.pref_plans = {}
         self.x8 = np.zeros(self.MR * m.H, dtype=np.float32)
         self.xb8 = np.zeros(self.MR * m.H, dtype=np.float32)
         self.q8b = np.zeros(self.MR * m.NQ, dtype=np.float32)
@@ -678,10 +681,19 @@ class Engine:
             # shipping a regression.
             if m.layout == "ime2q4":
                 # IME2 m4: 4 rows per weight stream, bit-identical to 4x M=1
-                self.f_layer_m8 = tilelang.compile(build_layer_m4(m, maxseq),
-                                                   out_idx=None,
-                                                   execution_backend="tvm_ffi")
-                print(f"[engine] IME2 M={self.MR} prefill enabled", flush=True)
+                # Measured in place on 0.6B (ms per prompt token): MR=4 9.8,
+                # MR=8 7.8, MR=16 7.1 -- bigger chunks amortise the 28 FFI
+                # calls and the per-row operators.  Which one wins depends on
+                # the prompt length, so compile all three and choose.
+                mrs = [_mr_env] if _mr_env else [4, 8, 16]
+                for mr in mrs:
+                    self.pref_plans[mr] = tilelang.compile(
+                        build_layer_m4(m, maxseq, MR=mr), out_idx=None,
+                        execution_backend="tvm_ffi")
+                self.MR = max(mrs)
+                self.f_layer_m8 = self.pref_plans[self.MR]
+                print(f"[engine] IME2 prefill plans {sorted(self.pref_plans)}",
+                      flush=True)
                 self.build_s = time.time() - t0
             elif m.H > 2048:
                 self.build_s = time.time() - t0
@@ -697,6 +709,7 @@ class Engine:
                 self.f_layer_m8 = tilelang.compile(build_layer_m8(m, maxseq),
                                                    out_idx=None,
                                                    execution_backend="tvm_ffi")
+                self.pref_plans = {self.MR: self.f_layer_m8}
             except Exception as exc:  # noqa: BLE001
                 # ime2q4 builds its own M=4 program below; only the RVV path can
                 # legitimately end up here.
@@ -719,18 +732,25 @@ class Engine:
             self.w[m.embed + tok * m.H * 2: m.embed + (tok + 1) * m.H * 2],
             dtype=np.float16)
 
-    def _prefill_chunk(self, chunk: list[int], base_pos: int) -> int:
+    def _prefill_chunk(self, chunk: list[int], base_pos: int, fn=None,
+                       mr: int | None = None) -> int:
         m = self.m
         for i, t in enumerate(chunk):
             self._embed_row(self.x8, i, t)
+        mr = self.MR if mr is None else mr
+        fn = self.f_layer_m8 if fn is None else fn
         self.pos[0] = base_pos
         for l in range(m.L):
             self.base[0] = m.layer_base + l * m.layer_stride
             self.li[0] = l
-            self.f_layer_m8(self.w, self.cs, self.sn, self.kc, self.vc, self.x8,
-                            self.xb8, self.q8b, self.kb8, self.vb8, self.att8,
-                            self.gug8, self.guu8, self.pos, self.base, self.li)
-        last = self.MR - 1
+            # The plan declares tensors of exactly mr rows; slicing keeps the
+            # ABI check happy when mr < the buffer size.
+            fn(self.w, self.cs, self.sn, self.kc, self.vc,
+               self.x8[:mr * m.H], self.xb8[:mr * m.H], self.q8b[:mr * m.NQ],
+               self.kb8[:mr * m.KV], self.vb8[:mr * m.KV],
+               self.att8[:mr * m.NQ], self.gug8[:mr * m.IM],
+               self.guu8[:mr * m.IM], self.pos, self.base, self.li)
+        last = mr - 1
         self.x[:] = self.x8[last * m.H:(last + 1) * m.H]
         self.f_head(self.w, self.x, self.xb, self.out, self.logits)
         return int(self.out[0])
@@ -765,10 +785,18 @@ class Engine:
         t0 = time.time()
         tok = prompt_ids[0]
         pos = 0
-        if self.f_layer_m8 is not None:
-            while pos + self.MR <= len(prompt_ids):
-                tok = self._prefill_chunk(prompt_ids[pos:pos + self.MR], pos)
-                pos += self.MR
+        if self.pref_plans:
+            # Relative cost per prompt token, measured on 0.6B; a one-token step
+            # counts as 1.0.  Picks the chunk size that wastes the least on this
+            # prompt's remainder.
+            _c = {4: 0.47, 8: 0.37, 16: 0.34}
+            n = len(prompt_ids)
+            mr = min(self.pref_plans,
+                     key=lambda k: (n // k) * k * _c.get(k, 0.4) + (n % k))
+            fn = self.pref_plans[mr]
+            while pos + mr <= len(prompt_ids) and pos + mr <= self.maxseq:
+                tok = self._prefill_chunk(prompt_ids[pos:pos + mr], pos, fn, mr)
+                pos += mr
         for i in range(pos, len(prompt_ids)):
             tok = self.step(prompt_ids[i], i)
         self.posn = len(prompt_ids)
