@@ -27,9 +27,25 @@
 **另一条教训**：对比测试本身错过两次——先拿 4 行结果去比"最后一个 M=1 行的输出"，
 得到 maxdiff 2.4 的假故障；kernel 其实一直是对的。
 
+## 2026-11-11 18:40 已接进引擎
+
+`build_layer_m4` 上线，`layout=ime2q4` 自动 MR=4，两个入口（decode 的 `ime2_gemv_q4`
+和 prefill 的 `ime2_gemm_q4_m`）合进同一个 `libime2bridge.so`，不再需要 LD_PRELOAD。
+
+0.6B Q4_0、27 token 提示词、OMP=7 实测：
+
+| 路径 | prefill | 说明 |
+|---|---:|---|
+| RVV 批量（M=8） | 25 ms/token | 旧 |
+| Q4 不批量 | 74 ms/token | 更早 |
+| **IME2 M=4** | **13.4 ms/token** | 362 ms / 27 token，其中 3 token 尾巴没凑满一个 chunk |
+
+按 GEMM 外推应该是 8.6，差的那 5 ms 在逐行算子：rope 与 qk_norm 是**按 head 发调用**
+（每行每层 24 次），一个 4 行 chunk 每层要发 ~7.8k 次 extern call。
+
 ## 下一步
 
-1. 把 `ime2_gemm_q4_m` 接进 `engine.py`：新 `build_layer_m4`（4 行 TIR 程序），
-   GEMV 走 M=4，逐行算子（rmsnorm/rope/qk_norm/attention）保持逐行；head 用 M=8。
-2. 用 0.6B 实测 prefill，对照 8.6 ms/token 的外推值。
-3. 若仍慢，量 attention/逐行算子的占比（decode 时它占约 3 ms/token，prefill 里会被 4 行摊薄）。
+1. **把 rope / qk_norm 从按头改成整段**：新增 `tl_riscv_rope_all(NQ, HD, cos, sin)` 与
+   `tl_riscv_head_norm_all`，用 head stride 循环，把 24 次调用压成 2 次。
+2. M=8 = 两个 4 行组（已在内核里支持），把 chunk 拉到 8 行摊薄逐行开销。
+3. 若还差，量 attention 在 p=64/128 时的占比，考虑 4 行一起做 QK^T。
