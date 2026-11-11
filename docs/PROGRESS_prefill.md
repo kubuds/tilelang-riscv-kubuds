@@ -52,9 +52,42 @@
 **无法证明有效**，已回退，不留未验证的复杂度。教训：以后 A/B 一律 min-of-5，
 并且先看 load。
 
+## 2026-11-11 19:40 chunk 大小与成本拆解
+
+原位测（`testing/riscv/ime/bench_chunk.py`，min of 7×5，无提示词噪声）：
+
+| chunk | ms/chunk | ms/token |
+|---|---:|---:|
+| MR=4 | 39.1 | 9.77 |
+| MR=8 | 62.2 | 7.78 |
+| MR=12 | 86.0 | 7.17 |
+| MR=16 | 113.9 | 7.12 |
+
+按提示词余数选 chunk（4/8/16 三个 plan），端到端：27 token 362→326 ms，
+84 token 1009→732 ms（8.7 ms/token）。
+
+**成本拆解**（`bench_chunk_pos.py`：同一 chunk 在不同 pos 计时，斜率即 attention）：
+
+| pos | chunk (MR=16) | ms/token |
+|---|---:|---:|
+| 0 | 110.4 | 6.90 |
+| 64 | 124.4 | 7.77 |
+| 128 | 136.9 | 8.55 |
+| 256 | 164.6 | 10.29 |
+
+attention 斜率 0.212 ms/(position·chunk)：p=128 时占 20%，p=256 时占 33%。
+**pos=0 的 6.9 ms/token 里约 91% 是 GEMM**（按 microbench 的 7 个矩阵 ×28 层反推 6.3）。
+
+## 已经排除的可能
+
+- 尾块补满 chunk：噪声里无收益，已回退。
+- perf 采样：JIT 模块无符号，且抓到别的进程，无法归因。
+- M≥8 的 vendor 内核：IME1 与 IME2 都只到 4 行（`count_m>=4` 走 m4，返回 4），
+  所以每 4 行就要重读一遍权重，这是 15 GB/s 有效带宽的来源。
+
 ## 下一步
 
-1. **把 rope / qk_norm 从按头改成整段**：新增 `tl_riscv_rope_all(NQ, HD, cos, sin)` 与
-   `tl_riscv_head_norm_all`，用 head stride 循环，把 24 次调用压成 2 次。
-2. M=8 = 两个 4 行组（已在内核里支持），把 chunk 拉到 8 行摊薄逐行开销。
-3. 若还差，量 attention 在 p=64/128 时的占比，考虑 4 行一起做 QK^T。
+1. **自写 M=16 的 smt.vmadot 内核**（唯一能突破"每 4 行重读权重"的办法）：
+   目标把 6.3 ms/token 的 GEMM 压到 2 ms 量级。这是新项目，不是调参。
+2. attention 批量：p=128 时占 20%，16 行一起做 QK^T 可省一半以上。
+3. rope/qk_norm 整段化：收益在微秒级，优先级最低。
