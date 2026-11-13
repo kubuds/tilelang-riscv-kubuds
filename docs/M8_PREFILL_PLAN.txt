@@ -1,0 +1,52 @@
+# M=8 prefill GEMM：可行性分析（2026-11-13）
+
+目标：prefill 现在 5.6 ms/token（llama.cpp 3.3），瓶颈是 vendor IME2 内核只到
+M=4，每 4 行重读一遍权重。要突破必须自写 >4 行的内核。本文记录读 vendor
+源码后得到的、可直接执行的结论。
+
+## 1. vendor 的 Q4 快路其实不是 IME2 tensor core，是 RVV `vmadot.hp i4`
+
+`ime2_kernels.cpp` 的 `gemm_kernel_i8i4_m4` 内层循环（生产分支，非 `#if 0`）：
+
+    vmadotsu.hp  v18, v3, v4, v1, 0, i4   // high 4 nibble
+    vmadotu.hp   v18, v2, v4, v0, 0, i4   // low  4 nibble
+
+- `vmadot.hp` 是 SpacemiT 的 4-bit 点积扩展，落在 `_xsmtvdotii` 这个 -march 段下。
+- 完整编译 march（从 ggml-cpu 的 flags.make 取到）：
+  `rv64gcv_zfh_zvfh_zicbop_zihintpause_zba_xsmtvdotii`
+- A（激活）先按 4-bit 拆成 low/high 两个 nibble 向量（`vsrl.vi + vnpack4.vv`），
+  B（Q4_0 权重）本来就是 4-bit，`vl4r.v` 一次装 4 行 × 32 列。
+- 许可证：`ime2_kernels.{h,cpp}` 是 SpacemiT MIT（`SPDX-License-Identifier: MIT`），
+  可引用、可改，需注明来源。
+
+## 2. 为什么 M=4 是天花板：寄存器饱和
+
+m4 内核的 clobber 列表把 v0..v31 + fa0..fa3 全部用掉（4×32 的 tile）。
+4 个 fp32 输出累加器（v28..v31）对应 4 行，其余全是 A/B 拆包与中间值。
+VLEN=1024 下 e32m1 = 32 通道，一个 4 行 × 32 列的 tile 正好填满。
+
+**结论：M=8 必须把列 tile 从 32 收窄到 16**，腾出 4 个寄存器放 8 个累加器
+（8 行 × 16 列 = 8 个 fp32 累加器 + 约 20 个工作寄存器 ≈ 28 < 32）。
+
+权重读一次的收益只取决于「每多少行重读一遍」：M/8 遍 < M/4 遍，正好 2×。
+列 tile 16 还是 32 只影响寄存器与 B 装载效率，不影响这个 2×。
+
+## 3. 要做的内核（M=8, tile 8×16）
+
+1. 照抄 vendor m4 内层循环的拆包序列（`vnpack4.vv` / `vupack.vv` / nibble 拆分），
+   只把累加器从 4 个扩到 8 个、列宽从 32 收到 16。
+2. 精确对齐 `vmadotsu.hp` / `vmadotu.hp` 的 6 操作数语义（vd, vs_a_hi, vs_b, scale, flag, i4）
+   与 `vpack`/`vrgather` 的结果重排——这是唯一的正确性风险点。
+3. 单独 microbench 对拍（vs 8× M=1 输出，要求 maxdiff≈0），再回原位接进
+   `ime2_all.cpp` 的 `ime2_gemm_q4_m`（M=8 分支）。
+
+## 4. 验证方式
+
+- 已确认 `-march=rv64gcv_zfh_zvfh_zicbop_zihintpause_zba_xsmtvdotii` 可汇编该扩展
+  （vendor 就是这么编的）；gcc 15.2 需 `vl1re8.v` 拼全元素类型，不能用裸 `vl1r.v`。
+- 正确性对拍：M=8 内核 vs 8 次 `ime2_gemv_q4`（已 bit-exact 验证过 M=4 这条路）。
+
+## 5. 预期
+
+权重读一次服务 8 行 → prefill GEMM 约减半，5.6 → 约 2.8 ms/token，
+**超过 llama.cpp 的 3.3**。这是「全面超过原生 llama.cpp」的最后一块。
