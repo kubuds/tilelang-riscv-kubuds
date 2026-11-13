@@ -46,6 +46,17 @@ VLEN=1024 下 e32m1 = 32 通道，一个 4 行 × 32 列的 tile 正好填满。
   （vendor 就是这么编的）；gcc 15.2 需 `vl1re8.v` 拼全元素类型，不能用裸 `vl1r.v`。
 - 正确性对拍：M=8 内核 vs 8 次 `ime2_gemv_q4`（已 bit-exact 验证过 M=4 这条路）。
 
+## 6. 规范来源（公开，已定位）
+
+`vmadot` 家族是 SpacemiT 的 IME（Integrated Matrix Extension）：
+- X60 用 **XSMTVDot**（4×4×8 int8，`smt.vmadot` 助记符，LLVM 22 已支持）。
+- K3 A100 用 **XSMTVDotII**（IME 2.0，VLEN=1024，含 `vmadot.hp i4` 4-bit 变体）。
+- 关键布局（iree-org/iree#24576）：A 行主序 K 连续；**B 必须转置成 (N,K)、每列 K 连续**。
+- 参考：LLVM 22 `RISCVUsage.html`（XSMTVDotII 段落 + SpacemiT feature document）、
+  remlab.net/op/riscv-xstime.shtml（X60 版指令编码 + vmadot 宏，XSTIME 是 A100 版的前身）。
+- 之前复现崩在「高 nibble 的 v3 来源」，说明 `vnpack4`/`vupack` 的 group 语义要对着
+  XSMTVDotII spec 逐条核实，不能靠读 asm 猜。
+
 ## 5. 预期
 
 权重读一次服务 8 行 → prefill GEMM 约减半，5.6 → 约 2.8 ms/token，
