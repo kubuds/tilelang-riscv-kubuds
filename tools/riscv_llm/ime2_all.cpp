@@ -86,13 +86,17 @@ extern "C" int ime2_gemv_q4(const void *packed, const float *x, float *y,
   size_t cap;
   uint8_t *qa = qa_buf(&cap, a_row * kNW);
 
+  // decode is DRAM-bound and its matrices are small (k/v N=512..1024), so 8
+  // workers only add launch/sync overhead; run it on a 4-tile grid over the
+  // shared 8-core stream.  Prefill (M=4..16) uses the full 8.
+  const int nw = 4;
   auto fut = stream->launch(
-      spert::Grid{(uint32_t)kNW},
+      spert::Grid{(uint32_t)nw},
       [](spert::Context *c, uint8_t *qa, const float *x, size_t a_row,
-         const void *w, float *y, int N, int K) {
+         const void *w, float *y, int N, int K, int nw) {
         const uint32_t ith = c->program_id(0);
         const int nblk = N / 32;
-        const int per = (nblk + kNW - 1) / kNW;          // 32-col blocks per worker
+        const int per = (nblk + nw - 1) / nw;            // 32-col blocks per worker
         const int n0 = ith * per * 32, n1 = std::min(N, n0 + per * 32);
         if (n0 >= n1) return;
         uint8_t *q = qa + (size_t)ith * a_row;
@@ -103,7 +107,7 @@ extern "C" int ime2_gemv_q4(const void *packed, const float *x, float *y,
                                                  (size_t)(n1 - n0), K / kBlk,
                                                  (size_t)N);
       },
-      qa, x, a_row, packed, y, N, K);
+      qa, x, a_row, packed, y, N, K, nw);
   fut.sync();
   return 0;
 }
