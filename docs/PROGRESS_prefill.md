@@ -97,6 +97,18 @@ Python{,3}_{EXECUTABLE,INCLUDE_DIR,LIBRARY} 全部指到 venv 的 3.12；
 8B Q4_0 + IME2 blob（5.50 GB）跑通：**decode 4.18 tok/s**（int8 1.95 → 2.14×，
 llama.cpp Q4_K_M 4.46 的 94%），prefill 5 token 602 ms。输出通顺。
 
+## 2026-11-13 22:40 8-worker IME2 流 + 两个真 bug
+
+发现 8 个 A100 worker 可用（早前 mahiru 的"w8 invalid"已过期）。过程中揪出两个真 bug：
+1) 两个 spert::Stream 会超订 8 核（输出 "!!!!"、prefill 30s），改成单共享流；
+2) 每 worker 按 `ceil(N/nw)` 切列，奇数 N（如 lm_head 151936/8=18992）留 16 列非 32 对齐，
+   内核越界 → 乱码，改成按 32 块切。合进 `tools/riscv_llm/ime2_all.cpp`。
+
+结果（0.6B Q4_0，原位 min）：prefill MR=16 **113.9 → 89.8 ms（7.12 → 5.61 ms/token，1.27×）**；
+decode 8 worker 42-43 vs 4 worker 44-46 tok/s（DRAM 界，约持平，噪声内）。
+
+回归：rebuild 后 `pytest testing/python/cpu` 86 passed / 2 skipped。
+
 ## 下一步
 
 1. **自写 M=16 的 smt.vmadot 内核**（唯一能突破"每 4 行重读权重"的办法）：
