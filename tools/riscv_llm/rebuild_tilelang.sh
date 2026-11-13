@@ -6,6 +6,10 @@
 # /usr/bin/python3 (3.14), which has no Cython and whose ABI does not match the
 # venv.  The venv python (3.12.13, uv-managed) bundles its own headers and
 # libpython, so point every Python variable at it explicitly.
+
+USE_ALTERNATIVE_LINKER=OFF matters: once lld is installed (it is, for IREE),
+TVM's AUTO picks it and the gcc-compiled objects fail to link (ld.lld "relocation
+refers to a symbol in a discarded section").  USE_ASCEND=OFF skips the NPU stubs.
 set -e
 cd "$(dirname "$0")/../.."          # repo root
 
@@ -14,7 +18,8 @@ VPY=/work/kubuds/hermes/flagos_ws/.venv/bin/python
 
 mkdir -p build_riscv && cd build_riscv
 cmake .. \
-  -DUSE_CUDA=OFF -DUSE_ROCM=OFF -DUSE_METAL=OFF -DUSE_LLVM=OFF \
+  -DUSE_CUDA=OFF -DUSE_ROCM=OFF -DUSE_METAL=OFF -DUSE_ASCEND=OFF \
+  -DUSE_LLVM=OFF -DUSE_ALTERNATIVE_LINKER=OFF \
   -DTILELANG_USE_CUDA_STUBS=OFF \
   -DPython_EXECUTABLE="$VPY" \
   -DPython_INCLUDE_DIR="$UV/include/python3.12" \
