@@ -85,6 +85,18 @@ attention 斜率 0.212 ms/(position·chunk)：p=128 时占 20%，p=256 时占 33
 - M≥8 的 vendor 内核：IME1 与 IME2 都只到 4 行（`count_m>=4` 走 m4，返回 4），
   所以每 4 行就要重读一遍权重，这是 15 GB/s 有效带宽的来源。
 
+## 2026-11-13 构建树消失 + 8B Q4 上线
+
+`build_riscv/` 与 `~/.tilelang/cache` 一夜消失（无重启无 rm），重建踩到两个新坑：
+1) cmake 的 `find_package(Python)` 选到 /usr/bin/python3（3.14，无 Cython），要把
+Python{,3}_{EXECUTABLE,INCLUDE_DIR,LIBRARY} 全部指到 venv 的 3.12；
+2) `USE_ALTERNATIVE_LINKER=AUTO` 在装了 lld（IREE 时装的）之后会选中 lld，
+   gcc 目标链接报 "relocation refers to a symbol in a discarded section"，
+   要 `-DUSE_ALTERNATIVE_LINKER=OFF`。重建脚本 `tools/riscv_llm/rebuild_tilelang.sh` 已含全部修复。
+
+8B Q4_0 + IME2 blob（5.50 GB）跑通：**decode 4.18 tok/s**（int8 1.95 → 2.14×，
+llama.cpp Q4_K_M 4.46 的 94%），prefill 5 token 602 ms。输出通顺。
+
 ## 下一步
 
 1. **自写 M=16 的 smt.vmadot 内核**（唯一能突破"每 4 行重读权重"的办法）：
