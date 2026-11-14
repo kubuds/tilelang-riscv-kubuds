@@ -140,10 +140,12 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
             # RISC-V flags are derived from target attrs (march/mabi/vlen/
             # ime2); see tilelang/riscv/toolchain.py for the rationale.
             from tilelang.riscv.toolchain import get_compile_flags as get_riscv_flags
+            from tilelang.riscv.toolchain import get_export_kwargs as get_riscv_export_kwargs
 
             flags = get_riscv_flags(self.target)
             if flags:
                 compile_args["options"] = list(compile_args.get("options", [])) + flags
+            compile_args.update(get_riscv_export_kwargs(self.target))
         if compile_args:
             # Precompile jit module with extra arguments.
             executable.jit(**compile_args)

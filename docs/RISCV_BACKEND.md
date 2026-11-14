@@ -21,12 +21,14 @@ target = {"kind": "riscv", "march": "rv64gcv", "mabi": "lp64d",
 
 ## 1. Baseline RV64GC
 
-`test_riscv_step1.py` (512^3 fp32, hand-written TIR loop nest): 1052 ms,
-2.8e-07 max rel error vs torch, `objdump | grep -c vsetvli` = 0. The C target is
-reused verbatim, only `-march=rv64gc` changes, so the baseline is "TVM's CPU
-path on RV64GC" by construction. Nothing in the backend emits ISA-specific code
-unless `rvv`/`ime2`/`vlen` ask for it, so an SG2042 userland gets the same
-binary shape (SG2042 was not reachable from this machine; only K3 was measured).
+`test_riscv_step1.py` (512^3 fp32, hand-written TIR loop nest): 231-234 ms,
+2.8e-07 max rel error vs torch, `objdump | grep -c vsetvli` = 0. (The 1052 ms
+quoted in earlier notes predates the `-O3` host flag and is obsolete.) The C
+target is reused verbatim, only `-march=rv64gc` changes, so the baseline is
+"TVM's CPU path on RV64GC" by construction. Nothing in the backend emits
+ISA-specific code unless `rvv`/`ime2`/`vlen` ask for it, so an SG2042 userland
+gets the same binary shape (SG2042 was not reachable from this machine; only
+K3 was measured).
 
 ## 2. RVV 1.0 (VLEN=256, X100)
 
@@ -55,7 +57,12 @@ What the numbers cost to find (`src/tl_templates/riscv/riscv.h`):
   2 KB stride; m2 halves the sweeps. This is the whole 5.5 -> 29.2 jump.
 * thread count is workload-shaped: pure FMA scales 63/122/151/92 GFLOP/s at
   1/2/4/8 threads, so compute-bound kernels want **4** and memory-bound GEMV
-  wants **7** (8 collapses to ~5 GFLOP/s on the GEMM).
+  wants **7** (8 used to collapse to ~5 GFLOP/s on the GEMM: an unbound
+  OpenMP team pays up to 600 us per fork when its workers wake on another
+  core, which dominates the small-tile shape. The kernels now pin each worker
+to its own CPU on first use -- see `bind_once` in
+  `src/tl_templates/riscv/riscv.h` -- and the same shape runs at 28-29
+  GFLOP/s at 8 threads; set `TL_RISCV_NO_BIND=1` to opt out).
 * `-march=rv64gcv` + `-O3` alone does *not* vectorise the TIR loop nest (12
   vector instructions, all prologue). Real RVV has to be written, not requested.
 
@@ -203,6 +210,12 @@ quarter of each block and reported 16.4 GB/s. Fixed in `gemv_m8_variants.c`.
 
 ## 7. Reproduce
 
+Build first with `tools/riscv_llm/rebuild_tilelang.sh` (or the equivalent
+cmake invocation): **`USE_LLVM=OFF` is required** for the riscv target --
+with LLVM enabled, TVM's LLVM codegen emits generic rv64i soft-float host
+objects that refuse to link with the `-mabi=lp64d` kernel objects
+("can't link soft-float modules with double-float modules").
+
 ```
 export PYTHONPATH=$PWD
 
@@ -216,6 +229,13 @@ python tools/riscv_llm/from_gguf.py Qwen3-8B-Q8_0.gguf /tmp/qwen3_8b.bin
 OMP_NUM_THREADS=7 python tools/riscv_llm/run_model.py /tmp/qwen3.bin \
   <tokenizer.json> --prompt "The capital of France is" --n 64 --raw
 ```
+
+For the `blas="openblas"` path, `TL_RISCV_OPENBLAS` must point at a
+`libopenblas.so.0` (the system package or a build under `thirdparty/OpenBLAS`),
+and that build must be **threaded** -- check `openblas_get_num_procs() > 1`;
+a single-threaded build silently caps the cblas path at ~26 GFLOP/s
+regardless of `OPENBLAS_NUM_THREADS`. The link records an rpath so no
+`LD_LIBRARY_PATH` is needed at load time.
 
 Regression: `pytest testing/python/cpu -q` -> 86 passed, 2 skipped.
 

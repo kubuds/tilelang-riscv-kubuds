@@ -105,6 +105,7 @@ static inline void gemv_q8_impl(int N, int K, const uint8_t *q,
 #pragma omp parallel for schedule(static)
 #endif
   for (int n = 0; n < N; ++n) {
+    bind_once();
     const int8_t *wr = w + (size_t)n * K;
     const uint16_t *sr = s + (size_t)n * kb;
     size_t vl32 = __riscv_vsetvl_e32m4((size_t)32);
@@ -136,6 +137,7 @@ static inline void gemv_q8_m8_impl(int N, int K, const uint8_t *q,
 #pragma omp parallel for schedule(static)
 #endif
   for (int n = 0; n < N; ++n) {
+    bind_once();
     const int8_t *wr = w + (size_t)n * K;
     const uint16_t *sr = s + (size_t)n * kb;
     /* Eight accumulators of 32-bit lanes fill the whole register file when the
@@ -213,6 +215,7 @@ static inline void gemv_q8_m8_kb_impl(int N, int K, const uint8_t *q,
 #pragma omp parallel for schedule(static)
 #endif
     for (int n = 0; n < N; ++n) {
+      bind_once();
       const int8_t *wr = w + (size_t)n * K + k0;
       const uint16_t *sr = s + (size_t)n * kb + (k0 >> 5);
       size_t vl = __riscv_vsetvl_e32m1((size_t)8);
@@ -281,6 +284,7 @@ static inline void gemv_q8_m8_slice_impl(int N, int K, int ws, int xs,
 #pragma omp parallel for schedule(static)
 #endif
   for (int n = 0; n < N; ++n) {
+    bind_once();
     const int8_t *wr = w + (size_t)n * ws;
     const uint16_t *sr = s + (size_t)n * (ws >> 5);
     size_t vl = __riscv_vsetvl_e32m1((size_t)8);
@@ -340,6 +344,7 @@ static inline void gemv_q4_impl(int N, int K, const uint8_t *q,
 #pragma omp parallel for schedule(static)
 #endif
   for (int n = 0; n < N; ++n) {
+    bind_once();
     const uint8_t *qr = q + (size_t)n * (K >> 1);
     const uint16_t *sr = s + (size_t)n * kb;
     size_t vl16 = __riscv_vsetvl_e32m2((size_t)16);
@@ -457,6 +462,7 @@ static inline void silu_mul_impl(int K, const float *g, const float *u, float *y
 #pragma omp parallel for schedule(static)
 #endif
   for (i = 0; i < K; ++i) {
+    bind_once();
     float x = g[i];
     y[i] = (x / (1.0f + expf(-x))) * u[i];
   }
@@ -490,6 +496,7 @@ static inline void attn_decode_impl(int nq, int nkv, int hd, int pos, int kvstri
 #pragma omp parallel for schedule(static)
 #endif
   for (int h = 0; h < nq; ++h) {
+    bind_once();
     const int kvh = (int)((long long)h * nkv / nq);
     const float *qh = q + (size_t)h * hd;
     const float *kb = kcache + (size_t)kvh * kvstride;
@@ -581,18 +588,21 @@ extern "C" int ime2_gemv_q4(const void *packed, const float *x, float *y,
 static inline int32_t tl_riscv_gemv_q4_ime2(int32_t N, int32_t K, uint8_t *q,
                                             uint8_t *sc, float *x, float *y) {
   (void)sc;
+  tl::rv::bind_restore();
   return ime2_gemv_q4(q, x, y, (int)N, (int)K);
 }
 
 static inline int32_t tl_riscv_gemv_q8(int32_t N, int32_t K, uint8_t *q,
                                        uint8_t *sc, float *x, float *y) {
   tl::rv::gemv_q8_impl(N, K, q, sc, x, y);
+  tl::rv::bind_restore();
   return 0;
 }
 
 static inline int32_t tl_riscv_gemv_q4(int32_t N, int32_t K, uint8_t *q,
                                        uint8_t *sc, float *x, float *y) {
   tl::rv::gemv_q4_impl(N, K, q, sc, x, y);
+  tl::rv::bind_restore();
   return 0;
 }
 
@@ -601,52 +611,61 @@ static inline int32_t tl_riscv_gemv_q8_m8_slice(
     int32_t beta, int32_t ws, int32_t xs) {
   tl::rv::gemv_q8_m8_slice_impl(N, K, ws, xs, q, (const uint16_t *)sc, x, y,
                                 beta);
+  tl::rv::bind_restore();
   return 0;
 }
 
 static inline int32_t tl_riscv_gemv_q8_m8_kb(int32_t N, int32_t K, uint8_t *q,
                                              uint8_t *sc, float *x, float *y) {
   tl::rv::gemv_q8_m8_kb_impl(N, K, q, (const uint16_t *)sc, x, y);
+  tl::rv::bind_restore();
   return 0;
 }
 
 static inline int32_t tl_riscv_gemv_q8_m8(int32_t N, int32_t K, uint8_t *q,
                                           uint8_t *sc, float *x, float *y) {
   tl::rv::gemv_q8_m8_impl(N, K, q, (const uint16_t *)sc, x, y);
+  tl::rv::bind_restore();
   return 0;
 }
 
 static inline int32_t tl_riscv_rmsnorm(int32_t K, float *x, uint8_t *g, float eps,
                                        float *y) {
   tl::rv::rmsnorm_impl(K, x, (const float *)g, eps, y);
+  tl::rv::bind_restore();
   return 0;
 }
 
 static inline int32_t tl_riscv_head_norm(int32_t hd, float *v, uint8_t *g,
                                          float eps) {
   tl::rv::head_norm_impl(hd, v, (const float *)g, eps);
+  tl::rv::bind_restore();
   return 0;
 }
 
 static inline int32_t tl_riscv_rope(int32_t hd, float *v, float *cs, float *sn) {
   tl::rv::rope_head_impl(hd, v, cs, sn);
+  tl::rv::bind_restore();
   return 0;
 }
 
 static inline int32_t tl_riscv_embed(int32_t K, uint8_t *tab, int32_t tok,
                                      float *y) {
   tl::rv::embed_impl(K, (const uint16_t *)tab, tok, y);
+  tl::rv::bind_restore();
   return 0;
 }
 
 static inline int32_t tl_riscv_silu_mul(int32_t K, float *g, float *u,
                                         float *y) {
   tl::rv::silu_mul_impl(K, g, u, y);
+  tl::rv::bind_restore();
   return 0;
 }
 
 static inline int32_t tl_riscv_add(int32_t K, float *dst, float *src) {
   tl::rv::add_impl(K, dst, src);
+  tl::rv::bind_restore();
   return 0;
 }
 
@@ -654,6 +673,7 @@ static inline int32_t tl_riscv_add(int32_t K, float *dst, float *src) {
  * is stored there as fp32). */
 static inline int32_t tl_riscv_add_u8(int32_t K, float *dst, uint8_t *src) {
   tl::rv::add_impl(K, dst, (const float *)src);
+  tl::rv::bind_restore();
   return 0;
 }
 
@@ -662,16 +682,19 @@ static inline int32_t tl_riscv_attn_decode(int32_t nq, int32_t nkv, int32_t hd,
                                            float scale, float *q, float *kc,
                                            float *vc, float *out) {
   tl::rv::attn_decode_impl(nq, nkv, hd, pos, kvstride, scale, q, kc, vc, out);
+  tl::rv::bind_restore();
   return 0;
 }
 
 static inline int32_t tl_riscv_copy(int32_t n, float *dst, float *src) {
   tl::rv::copy_impl(n, dst, src);
+  tl::rv::bind_restore();
   return 0;
 }
 
 static inline int32_t tl_riscv_argmax(int32_t n, float *x, int32_t *out) {
   tl::rv::argmax_impl(n, x, out);
+  tl::rv::bind_restore();
   return 0;
 }
 

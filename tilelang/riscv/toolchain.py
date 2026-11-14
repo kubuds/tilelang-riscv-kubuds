@@ -41,6 +41,58 @@ def _attr_str(target: Target, name: str, default: str) -> str:
     return str(value)
 
 
+def pack_imports_to_c(module, is_system_lib: bool, pack_lib_prefix: str, workspace_dir: str) -> str:
+    """``fpack_imports`` callback that writes ``devc.c`` instead of ``devc.o``.
+
+    ``Module.export_library`` packs module imports through TVM's LLVM whenever
+    the runtime has LLVM enabled; the resulting ``devc.o`` is a generic rv64i
+    soft-float object that cannot link with the ``-mabi=lp64d`` kernel objects
+    ("can't link soft-float modules with double-float modules").  Emitting C
+    source instead routes the pack through the same gcc invocation as every
+    other translation unit, so the whole link shares one ABI.
+    """
+    from tilelang import tvm
+
+    path_cc = os.path.join(workspace_dir, f"{pack_lib_prefix}devc.c")
+    src = tvm.ffi.get_global_func("runtime.ModulePackImportsToC")(module, is_system_lib, pack_lib_prefix)
+    with open(path_cc, "w") as f:
+        f.write(src)
+    return path_cc
+
+
+def get_export_kwargs(target: Target) -> dict:
+    """Extra ``export_library``/``jit`` kwargs required by a ``riscv`` target."""
+    if target.kind.name != "riscv":
+        return {}
+    return {"fpack_imports": pack_imports_to_c}
+
+
+def _openblas_flags(target: Target) -> list[str]:
+    """Link flags for the optional cblas fast path (``blas="openblas"``)."""
+    lib = os.environ.get("TL_RISCV_OPENBLAS", _DEFAULT_OPENBLAS)
+    if not os.path.exists(lib):
+        raise FileNotFoundError(
+            f"OpenBLAS not found at {lib!r}.  Install libopenblas0, or point "
+            "TL_RISCV_OPENBLAS at a libopenblas.so.0 you built (e.g. "
+            "thirdparty/OpenBLAS)."
+        )
+    # The generated C only includes tl_templates/cpp/common.h, so cblas.h
+    # must be force-included; -include is order-independent and works for
+    # both .c and .cc compilation units.
+    # TVM compiles the generated C with g++, so the CBLAS enums in
+    # cblas.h are typed and int literals from call_extern are rejected;
+    # -fpermissive keeps the (correct) integer values usable.
+    # TVM puts options before the object files, so --as-needed would
+    # discard the library before it sees the reference.
+    # The link records the library soname (libopenblas.so.0), not its path,
+    # so the runtime loader needs an rpath to find it again at dlopen time;
+    # without it the kernel fails with "libopenblas.so.0: cannot open shared
+    # object file" unless LD_LIBRARY_PATH is exported.
+    lib_dir = os.path.dirname(os.path.abspath(lib))
+    flags = ["-fpermissive", "-Wl,--no-as-needed", lib, f"-Wl,-rpath,{lib_dir}", "-lm"]
+    return flags
+
+
 def get_compile_flags(target: Target) -> list[str]:
     """Return extra gcc flags for a ``riscv`` target (empty for others)."""
     if target.kind.name != "riscv":
@@ -100,15 +152,6 @@ def get_compile_flags(target: Target) -> list[str]:
 
     blas = _attr_str(target, "blas", "")
     if blas:
-        lib = os.environ.get("TL_RISCV_OPENBLAS", _DEFAULT_OPENBLAS)
-        # The generated C only includes tl_templates/cpp/common.h, so cblas.h
-        # must be force-included; -include is order-independent and works for
-        # both .c and .cc compilation units.
-        # TVM compiles the generated C with g++, so the CBLAS enums in
-        # cblas.h are typed and int literals from call_extern are rejected;
-        # -fpermissive keeps the (correct) integer values usable.
-        # TVM puts options before the object files, so --as-needed would
-        # discard the library before it sees the reference.
-        flags.extend(["-fpermissive", "-Wl,--no-as-needed", lib, "-lm"])
+        flags.extend(_openblas_flags(target))
 
     return flags

@@ -22,12 +22,13 @@ class TVMFFIKernelCache(KernelCache):
         # built with generic options and fails to find tl_templates/cpp/.
         target = getattr(kernel, "target", None)
         if target is not None and getattr(target.kind, "name", None) == "riscv":
-            from tilelang.riscv.toolchain import get_compile_flags
+            from tilelang.riscv.toolchain import get_compile_flags, get_export_kwargs
 
+            kwargs = dict(kwargs)
             flags = get_compile_flags(target)
             if flags:
-                kwargs = dict(kwargs)
                 kwargs["options"] = list(kwargs.get("options", [])) + flags
+            kwargs.update(get_export_kwargs(target))
         return kwargs
 
     def _save_wrapper_kernel_code_to_disk(self, kernel: JITKernel, cache_path: str, verbose: bool = False):

@@ -39,10 +39,18 @@
 #ifndef TL_TEMPLATES_RISCV_RISCV_H_
 #define TL_TEMPLATES_RISCV_RISCV_H_
 
+/* sched_getaffinity/sched_setaffinity (bind_once) need the GNU extensions in
+ * C translation units; g++ predefines _GNU_SOURCE already.  Must come first:
+ * feature test macros are locked in by the first libc header. */
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE
+#endif
+
 #include "tl_templates/cpp/common.h"
 
 #include <math.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include <riscv_vector.h>
@@ -50,9 +58,89 @@
 #if defined(_OPENMP)
 #include <omp.h>
 #endif
+#if defined(_OPENMP) && defined(__linux__)
+#include <sched.h>
+#endif
 
 namespace tl {
 namespace rv {
+
+/* Pin every OpenMP worker to its own CPU the first time it enters a parallel
+ * region.  Measured on K3 X100: with unbound workers a fork/join costs up to
+ * 600 us (workers wake on another core and re-fault their state), which
+ * dominates the small-tile GEMM shape -- 64 calls of 128^3 fall to 5.3
+ * GFLOP/s at 8 threads while a bound team runs the same code at 28-29.
+ *
+ * The calling thread (OpenMP thread 0) is re-pinned for every region and
+ * restored by bind_restore() at the end of each tl_riscv_* entry point: its
+ * affinity mask is inherited by any thread pool created later (OpenBLAS
+ * workers are created lazily on the first cblas_sgemm call), so a permanent
+ * pin would trap them on one core -- measured 43 -> 20 GFLOP/s on the
+ * blas="openblas" path.
+ *
+ * Binding is a no-op when the user already requested placement
+ * (OMP_PROC_BIND/OMP_PLACES) and can be disabled with TL_RISCV_NO_BIND=1. */
+#if defined(__cplusplus)
+#define TL_BIND_ONCE_LOCAL thread_local
+#else
+#define TL_BIND_ONCE_LOCAL _Thread_local
+#endif
+#if defined(_OPENMP) && defined(__linux__)
+/* Touched only by the thread that calls the kernel entry points (OpenMP
+ * thread 0), so no synchronisation is needed. */
+static cpu_set_t tl_bind_saved;
+static int tl_bind_have_saved = 0;
+static TL_BIND_ONCE_LOCAL int tl_bind_done = 0;
+#endif
+static inline void bind_once(void) {
+#if defined(_OPENMP) && defined(__linux__)
+  if (tl_bind_done) return;
+  const char *opt = getenv("TL_RISCV_NO_BIND");
+  if (opt && opt[0] != '\0' && opt[0] != '0') return;
+  /* Respect an explicit placement policy instead of fighting it. */
+  if (omp_get_proc_bind() != omp_proc_bind_false) return;
+  tl_bind_done = 1;
+  int tid = omp_get_thread_num();
+  if (tid == 0 && !tl_bind_have_saved) {
+    /* The calling thread keeps its full mask outside the kernel: save it
+     * once before the first pin. */
+    if (sched_getaffinity(0, sizeof(tl_bind_saved), &tl_bind_saved) != 0) return;
+    tl_bind_have_saved = 1;
+  }
+  cpu_set_t allowed;
+  CPU_ZERO(&allowed);
+  if (sched_getaffinity(0, sizeof(allowed), &allowed) != 0) return;
+  int ncpu = CPU_COUNT(&allowed);
+  if (ncpu <= 0) return;
+  int want = tid % ncpu;
+  cpu_set_t one;
+  CPU_ZERO(&one);
+  int seen = 0;
+  for (int c = 0; c < CPU_SETSIZE; ++c) {
+    if (CPU_ISSET(c, &allowed)) {
+      if (seen++ == want) {
+        CPU_SET(c, &one);
+        break;
+      }
+    }
+  }
+  sched_setaffinity(0, sizeof(one), &one);
+#endif
+}
+
+/* Undo the calling thread's pin.  Every tl_riscv_* entry point calls this
+ * before returning so that the caller's affinity (and that of any thread pool
+ * it creates afterwards) is unchanged by running a kernel.  Resets the
+ * one-shot flag so the next entry point pins again. */
+static inline void bind_restore(void) {
+#if defined(_OPENMP) && defined(__linux__)
+  tl_bind_done = 0;
+  if (tl_bind_have_saved) {
+    sched_setaffinity(0, sizeof(tl_bind_saved), &tl_bind_saved);
+    tl_bind_have_saved = 0;
+  }
+#endif
+}
 
 /* ------------------------------------------------------------------ *
  * fp32 GEMM: C[M,N] = A[M,K] * B[K,N], row-major, explicit strides.
@@ -91,6 +179,7 @@ static inline void gemm_f32_impl(int M, int N, int K, const float *A,
 #pragma omp parallel for schedule(static)
 #endif
     for (int i0 = 0; i0 < M; i0 += MR) {
+      bind_once();
       if (i0 + MR <= M) {
         for (int j = 0; j < jn;) {
           size_t vl = __riscv_vsetvl_e32m2((size_t)(jn - j));
@@ -189,6 +278,7 @@ static inline int32_t tl_riscv_gemm_f32(int32_t M, int32_t N, int32_t K,
                                         int32_t ldb, float *C, int32_t ldc,
                                         int32_t beta) {
   tl::rv::gemm_f32_impl(M, N, K, A, lda, B, ldb, C, ldc, beta);
+  tl::rv::bind_restore();
   return 0;
 }
 
@@ -196,8 +286,15 @@ static inline int32_t tl_riscv_gemm_f32(int32_t M, int32_t N, int32_t K,
 
 /* The LLM primitives (GEMV, RMSNorm, RoPE, attention) are header-only and
  * only reachable through T.call_extern from the tilelang/riscv/llm driver;
- * pulling them in here keeps the toolchain to a single -include. */
+ * pulling them in here keeps the toolchain to a single -include.
+ *
+ * llm.h uses RVV intrinsics unconditionally, so it must stay out of rv64gc
+ * (no-V) translation units: the step-1 baseline is compiled with
+ * -march=rv64gc and GCC rejects vfloat32m1_t there ("requires the V ISA
+ * extension").  ime2.h is guarded by TL_RISCV_IME2 inside itself. */
+#if defined(__riscv_vector)
 #include "tl_templates/riscv/llm.h"
+#endif
 #include "tl_templates/riscv/ime2.h"
 
 #endif // TL_TEMPLATES_RISCV_RISCV_H_

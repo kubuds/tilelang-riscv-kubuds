@@ -321,7 +321,15 @@ def create_backend_context(
     assert isinstance(normalized_target, Target)
 
     if target_host is None:
-        target_host = "llvm" if tvm.runtime.enabled("llvm") else "c"
+        # RISC-V: only the C host codegen receives the toolchain flags
+        # (-march/-mabi/-mrvv-*); TVM's LLVM codegen emits a generic rv64i
+        # soft-float host object that refuses to link with the -mabi=lp64d
+        # kernel objects ("can't link soft-float modules with double-float
+        # modules").  See tilelang/riscv/toolchain.py.
+        if normalized_target.kind.name == "riscv":
+            target_host = "c"
+        else:
+            target_host = "llvm" if tvm.runtime.enabled("llvm") else "c"
     normalized_target_host = Target(target_host)
     normalized_target = Target(normalized_target, normalized_target_host)
 

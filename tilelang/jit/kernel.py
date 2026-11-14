@@ -790,10 +790,12 @@ class JITKernel(Generic[_P, _T]):
                 # would otherwise drop the ISA flags derived from the
                 # target; see tilelang/riscv/toolchain.py.
                 from tilelang.riscv.toolchain import get_compile_flags as get_riscv_flags
+                from tilelang.riscv.toolchain import get_export_kwargs as get_riscv_export_kwargs
 
                 flags = get_riscv_flags(self.target)
                 if flags:
                     export_kwargs["options"] = flags
+                export_kwargs.update(get_riscv_export_kwargs(self.target))
             runtime_module.export_library(kernel_file, **export_kwargs)
         elif not (os.path.exists(kernel_file) and os.path.samefile(cached_library, kernel_file)):
             shutil.copyfile(cached_library, kernel_file)
